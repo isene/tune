@@ -22,16 +22,16 @@ ureq     = { version = "2", features = ["tls"] }
 tokio    = { version = "1", features = ["rt", "macros", "sync", "time"] }
 
 # librespot — Spotify Connect endpoint. Per-target feature split:
-#  - Linux: pulseaudio-backend (native PulseAudio / PipeWire-pulse,
-#    idle-suspends when nothing plays).
-#  - macOS / other: rodio-backend (CoreAudio on macOS, cross-platform
-#    fallback elsewhere — no libpulse-dev required).
+#  - x86_64-linux: pulseaudio-backend (native PulseAudio /
+#    PipeWire-pulse, best idle-suspension + battery profile).
+#  - everything else: rodio-backend (no libpulse-dev needed, so
+#    aarch64-linux + macOS cross-compile cleanly).
 # `with-libmdns` / `with-avahi` are intentionally OFF: zeroconf adds
 # periodic wakeups and we authenticate via OAuth, not LAN broadcast.
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 librespot = { version = "0.8", default-features = false, features = ["pulseaudio-backend", "rustls-tls-native-roots"] }
 
-[target.'cfg(not(target_os = "linux"))'.dependencies]
+[target.'cfg(not(all(target_os = "linux", target_arch = "x86_64")))'.dependencies]
 librespot = { version = "0.8", default-features = false, features = ["rodio-backend", "rustls-tls-native-roots"] }
 
 [profile.release]
