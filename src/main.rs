@@ -97,23 +97,42 @@ struct App {
     /// displayed track id; we re-download + re-place only on change.
     cover_display:  Option<Display>,
     cover_track_id: Option<String>,
+    /// Cover width in cells, derived from the terminal's cell aspect
+    /// ratio so the rendered cover fills the strip's full pixel
+    /// height. Sampled at init and on resize (cell px-size is
+    /// stable across resizes on every terminal we care about, but
+    /// re-sampling is cheap insurance).
+    cover_w: u16,
 }
 
-/// Height of the now-playing strip in rows. Spotify covers are
-/// square (640 × 640); glow scales the image to fit the (cells_w ×
-/// cell_px_w, cells_h × cell_px_h) bounding box while preserving
-/// aspect. With typical terminal cells around 8 × 22 px (taller
-/// than wide), WIDTH dominates — so growing COVER_W gets us a
-/// bigger cover, and we size NOW_H to fit the resulting square.
-/// 30 cells × 8 px ≈ 240 px wide → 240 px tall image → ~11 cells
-/// tall, so NOW_H = 14 leaves a small margin below for breathing.
+/// Height of the now-playing strip in rows. The cover art fills
+/// this strip height-to-edge; its width-in-cells is computed
+/// dynamically from the terminal's actual cell aspect ratio
+/// (see `cover_cell_width_for_height` below) so a square Spotify
+/// cover ends up as a square pixel image that uses every pixel
+/// row of the strip — no wasted vertical space.
 const NOW_H: u16 = 14;
-/// Cover thumbnail width in cells. See NOW_H comment.
-const COVER_W: u16 = 30;
 /// Left padding before the cover. Starting at col 2 leaves a one-
 /// cell gutter against the terminal edge instead of butting the
 /// art straight up against the frame.
 const COVER_X: u16 = 2;
+
+/// Compute the cover thumbnail's width in cells so that a square
+/// image scaled to `NOW_H` rows of pixel height comes out exactly
+/// `NOW_H` rows of pixel height in the rendered strip. Reason:
+/// glow scales aspect-preserving to fit the (cells_w × cell_px_w,
+/// cells_h × cell_px_h) box; if cells are taller than wide (which
+/// they usually are: ~1:2 to 1:3 ratio), a square image at the
+/// full `NOW_H` row height needs `cells_w = NOW_H × cell_h_px /
+/// cell_w_px` cells to fit. Falls back to `NOW_H * 2` cells when
+/// the terminal won't report pixel dimensions (glow's default
+/// guess is 10 × 20, giving a 2:1 cell-aspect baseline).
+fn cover_cell_width_for_height(rows: u16) -> u16 {
+    let (cell_w, cell_h) = glow::get_cell_size();
+    if cell_w == 0 || cell_w >= cell_h { return rows.saturating_mul(2); }
+    let target = (rows as u32) * (cell_h as u32) / (cell_w as u32);
+    target.min(u16::MAX as u32) as u16
+}
 
 impl App {
     fn new(spotify: AuthCodePkceSpotify, poll_s: u64, default_device: String) -> Self {
@@ -124,7 +143,7 @@ impl App {
         // now-pane spans full width — glow draws the cover at z=1
         // (above text) so the leftmost cells of the pane bg show
         // through everywhere the cover doesn't cover. Text content
-        // is indented past `COVER_W` cells inside render_now.
+        // is indented past `cover_w` cells inside render_now.
         let now_p  = Pane::new(1, rows - NOW_H, cols, NOW_H,
                                t::FG_BRIGHT as u16, t::BG_NOW as u16);
         let footer = Pane::new(1, rows, cols, 1, t::FG as u16, t::BG_BAR as u16);
@@ -158,6 +177,7 @@ impl App {
             default_device,
             cover_display: None,
             cover_track_id: None,
+            cover_w: cover_cell_width_for_height(NOW_H),
         }
     }
 
@@ -273,12 +293,12 @@ impl App {
 
     fn render_now(&mut self) {
         // Indent each line past the cover thumbnail: COVER_X cells
-        // of left gutter, COVER_W cells of cover, and one more cell
+        // of left gutter, cover_w cells of cover, and one more cell
         // of gap before the text. The pane spans full width so its
         // bg fills edge-to-edge; the kitty cover image is placed
         // at z=1 and overlays the leftmost cells without clobbering
         // the bg color underneath.
-        let pad = " ".repeat((COVER_X + COVER_W + 1) as usize);
+        let pad = " ".repeat((COVER_X + self.cover_w + 1) as usize);
         let mut lines: Vec<String> = Vec::new();
         lines.push(String::new());
         match &self.playback {
@@ -396,11 +416,15 @@ impl App {
         let (_, rows) = Crust::terminal_size();
         let display = self.cover_display.get_or_insert_with(Display::new);
         // Place at (COVER_X, top row of the now-pane). show() sizes
-        // to (COVER_W × NOW_H) cells; glow scales the image to fit.
+        // to (self.cover_w × NOW_H) cells. cover_w is computed from
+        // the terminal's actual cell aspect ratio, so a square
+        // Spotify cover scales to exactly NOW_H rows of pixel height
+        // — the strip fills top-to-bottom with no wasted vertical
+        // space beneath the artwork.
         let placed = display.show(
             &cache_path.to_string_lossy(),
             COVER_X, rows.saturating_sub(NOW_H) + 1,
-            COVER_W, NOW_H);
+            self.cover_w, NOW_H);
         if placed { self.cover_track_id = Some(track_id); }
     }
 
@@ -409,8 +433,8 @@ impl App {
         let (_, rows) = Crust::terminal_size();
         if let Some(d) = self.cover_display.as_mut() {
             let (cols, _) = Crust::terminal_size();
-            d.clear(COVER_X, rows.saturating_sub(NOW_H) + 1, COVER_W, NOW_H,
-                    cols, rows);
+            d.clear(COVER_X, rows.saturating_sub(NOW_H) + 1,
+                    self.cover_w, NOW_H, cols, rows);
         }
         self.cover_track_id = None;
     }
@@ -1394,7 +1418,12 @@ impl App {
                                 t::FG_BRIGHT as u16, t::BG_NOW as u16);
         self.now_p.wrap = false; self.now_p.scroll = false;
         self.footer = Pane::new(1, rows, cols, 1, t::FG as u16, t::BG_BAR as u16);
-        // Force re-placement of the cover after resize.
+        // Re-sample cell aspect (cheap; one ioctl) and force a
+        // fresh cover placement after resize. cell px-size is
+        // stable across resizes on every terminal we care about
+        // but resampling is insurance against multi-monitor DPI
+        // changes etc.
+        self.cover_w = cover_cell_width_for_height(NOW_H);
         self.cover_track_id = None;
         self.footer.wrap = false; self.footer.scroll = false;
         Crust::clear_screen();
