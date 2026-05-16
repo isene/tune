@@ -85,10 +85,12 @@ fn run(access_token: String, device_name: String, shutdown_rx: oneshot::Receiver
         };
         let session = Session::new(session_config, None);
         let credentials = Credentials::with_access_token(access_token);
-        if let Err(e) = session.connect(credentials.clone(), false).await {
-            eprintln!("librespot: session connect failed: {}", e);
-            return;
-        }
+        // Do NOT call `session.connect()` here — Spirc::new does its
+        // own connect-with-credentials internally. Calling both
+        // leaves Spirc unable to reach the AP connection's send_packet
+        // channel (the OnceCell behind tx_connection is single-use),
+        // and Spirc fails with "Service unavailable { Session is not
+        // connected }". Tested against librespot 0.8.0.
 
         // Player: ogg decode + audio backend. PulseAudio backend
         // talks libpulse directly (PipeWire's pulse compat layer

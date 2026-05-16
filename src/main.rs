@@ -583,8 +583,11 @@ impl App {
         let q = q.trim().to_string();
         if q.is_empty() { return; }
         self.search_query = q.clone();
-        match self.spotify.search(&q, SearchType::Track, Some(Market::Country(Country::Norway)),
-                                  None, Some(30), None) {
+        // Spotify capped Search API `limit` to 10 (down from 50) in
+        // Feb 2026 — passing 30 returns 400 Bad Request.
+        match self.spotify.search(&q, SearchType::Track,
+                                  Some(Market::Country(Country::Norway)),
+                                  None, Some(10), None) {
             Ok(SearchResult::Tracks(p)) => {
                 self.search_results = p.items;
                 self.search_idx = 0;
@@ -949,6 +952,20 @@ fn main() {
         None
     };
 
+    // Redirect stderr to ~/.tune/tune.log BEFORE entering the TUI's
+    // alt-screen so librespot / rspotify error messages survive (the
+    // alt-screen otherwise swallows everything written to fd 2).
+    // Best-effort: failure here is non-fatal, just means we lose
+    // log visibility for that session.
+    redirect_stderr_to_log();
+    // Install a default log filter that surfaces librespot's session
+    // / playback / spirc warnings + errors. `RUST_LOG=...` overrides
+    // for deep debugging.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,librespot=info"))
+        .target(env_logger::Target::Stderr)
+        .init();
+
     Crust::init();
     Crust::set_app_identity("Tune");
     Crust::clear_screen();
@@ -965,6 +982,33 @@ fn main() {
     }
     Cursor::show();
     Crust::cleanup();
+}
+
+/// Reopen fd 2 (stderr) onto `~/.tune/tune.log` (append) so anything
+/// printed via `eprintln!` / librespot's `log` / rspotify error paths
+/// gets captured for post-mortem instead of vanishing into the
+/// alt-screen. Truncates the file on each launch to keep it small.
+fn redirect_stderr_to_log() {
+    use std::os::fd::AsRawFd;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = std::path::PathBuf::from(&home).join(".tune");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("tune.log");
+    let Ok(f) = std::fs::OpenOptions::new()
+        .create(true).write(true).truncate(true)
+        .open(&path) else { return; };
+    let raw = f.as_raw_fd();
+    // SAFETY: dup2 swaps fd 2 to point at the log file. The original
+    // stderr fd is closed by dup2; we let the `File` go out of scope
+    // after the dup so the underlying fd survives via fd 2.
+    unsafe { libc::dup2(raw, 2); }
+    std::mem::forget(f); // keep the fd alive; dup2 already aliased it
+    eprintln!("=== tune v{} starting at {} ===",
+        VERSION,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0));
 }
 
 impl App {

@@ -1,6 +1,6 @@
 [package]
 name = "tune"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Spotify Connect controller TUI. Part of the Fe2O3 Rust terminal suite."
@@ -17,6 +17,11 @@ serde    = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 ureq     = { version = "2", features = ["tls"] }
+libc     = "0.2"
+# Tiny log subscriber so librespot's `log!` lines (which are no-ops
+# without an installed logger) actually surface. Routed to fd 2,
+# which `redirect_stderr_to_log` retargets to ~/.tune/tune.log.
+env_logger = { version = "0.11", default-features = false }
 # Async runtime for librespot's Spirc loop. Single-threaded scheduler
 # only — one connect session, no work-stealing required.
 tokio    = { version = "1", features = ["rt", "macros", "sync", "time"] }
