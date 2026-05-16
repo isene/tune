@@ -1,6 +1,6 @@
 [package]
 name = "tune"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Spotify Connect controller TUI. Part of the Fe2O3 Rust terminal suite."

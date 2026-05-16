@@ -99,14 +99,18 @@ struct App {
     cover_track_id: Option<String>,
 }
 
-/// Height of the now-playing strip in rows. 8 rows × 14 cells of
-/// cover artwork comes out roughly square on typical 8×16-pixel
-/// cells (112 × 128 px) — big enough to actually see the cover,
-/// small enough to leave the main pane the dominant region.
-const NOW_H: u16 = 8;
-/// Cover thumbnail width in cells. Paired with NOW_H to keep the
-/// thumbnail roughly square at typical terminal cell aspect ratios.
-const COVER_W: u16 = 14;
+/// Height of the now-playing strip in rows. 10 rows of cover height
+/// at typical 8×16-pixel terminal cells = 160 px tall. Paired with
+/// COVER_W below to keep the thumbnail roughly square.
+const NOW_H: u16 = 10;
+/// Cover thumbnail width in cells. 20 cells × 8 px ≈ 160 px wide
+/// (roughly square at typical cell aspect ratios — terminal cells
+/// are ~1:2, so 20w × 10h cells maps to a near-square pixel box).
+const COVER_W: u16 = 20;
+/// Left padding before the cover. Starting at col 2 leaves a one-
+/// cell gutter against the terminal edge instead of butting the
+/// art straight up against the frame.
+const COVER_X: u16 = 2;
 
 impl App {
     fn new(spotify: AuthCodePkceSpotify, poll_s: u64, default_device: String) -> Self {
@@ -265,11 +269,13 @@ impl App {
     }
 
     fn render_now(&mut self) {
-        // Indent each line past the cover thumbnail (COVER_W cells +
-        // 1 gap col). The pane spans full width so its bg fills
-        // edge-to-edge; the kitty cover image is z=1 and overlays
-        // the leftmost cells without clobbering the bg color.
-        let pad = " ".repeat(COVER_W as usize + 1);
+        // Indent each line past the cover thumbnail: COVER_X cells
+        // of left gutter, COVER_W cells of cover, and one more cell
+        // of gap before the text. The pane spans full width so its
+        // bg fills edge-to-edge; the kitty cover image is placed
+        // at z=1 and overlays the leftmost cells without clobbering
+        // the bg color underneath.
+        let pad = " ".repeat((COVER_X + COVER_W + 1) as usize);
         let mut lines: Vec<String> = Vec::new();
         lines.push(String::new());
         match &self.playback {
@@ -386,12 +392,11 @@ impl App {
         }
         let (_, rows) = Crust::terminal_size();
         let display = self.cover_display.get_or_insert_with(Display::new);
-        // Place at (col 1, row rows - NOW_H + 1) — left edge of the
-        // now-playing strip, in the first row. show() sizes to
-        // (COVER_W × NOW_H) cells; the image is scaled to fit.
+        // Place at (COVER_X, top row of the now-pane). show() sizes
+        // to (COVER_W × NOW_H) cells; glow scales the image to fit.
         let placed = display.show(
             &cache_path.to_string_lossy(),
-            1, rows.saturating_sub(NOW_H) + 1,
+            COVER_X, rows.saturating_sub(NOW_H) + 1,
             COVER_W, NOW_H);
         if placed { self.cover_track_id = Some(track_id); }
     }
@@ -401,7 +406,7 @@ impl App {
         let (_, rows) = Crust::terminal_size();
         if let Some(d) = self.cover_display.as_mut() {
             let (cols, _) = Crust::terminal_size();
-            d.clear(1, rows.saturating_sub(NOW_H) + 1, COVER_W, NOW_H,
+            d.clear(COVER_X, rows.saturating_sub(NOW_H) + 1, COVER_W, NOW_H,
                     cols, rows);
         }
         self.cover_track_id = None;
