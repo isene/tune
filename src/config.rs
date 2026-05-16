@@ -22,9 +22,24 @@ pub struct Config {
     /// Empty = whatever Spotify Connect picks (last-used device).
     #[serde(default)]
     pub default_device: String,
+
+    /// Whether tune registers itself as a Spotify Connect device
+    /// (via librespot) on launch. Default `true`. Set to `false`
+    /// for controller-only mode (e.g. on a server where there's no
+    /// audio device).
+    #[serde(default = "default_true")]
+    pub local_player: bool,
+
+    /// Device name shown in everyone's Spotify Connect picker.
+    /// Default "tune". Useful to override if you run tune on
+    /// multiple machines: "tune (laptop)", "tune (desktop)", etc.
+    #[serde(default = "default_device_name")]
+    pub device_name: String,
 }
 
 fn default_poll_s() -> u64 { 2 }
+fn default_true() -> bool { true }
+fn default_device_name() -> String { "tune".into() }
 
 pub fn tune_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());

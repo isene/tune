@@ -29,14 +29,31 @@ pub const REDIRECT_URI: &str = "http://127.0.0.1:8888/callback";
 /// authorize URL (delete `~/.tune/token.json` to force).
 pub fn required_scopes() -> std::collections::HashSet<String> {
     scopes!(
+        // Controller (Web API).
         "user-read-playback-state",
         "user-modify-playback-state",
         "user-read-currently-playing",
         "user-read-private",
         "user-library-read",
         "playlist-read-private",
-        "playlist-read-collaborative"
+        "playlist-read-collaborative",
+        // Local audio device (librespot Spirc session).
+        // `streaming` is the gate on actually playing audio — Premium
+        // only, and without it librespot's connection to the AP server
+        // succeeds but every track stream request returns 403.
+        "streaming"
     )
+}
+
+/// Whether the cached token covers every scope in `required_scopes`.
+/// Used by main() to detect a stale cache after we extend the scope
+/// list (e.g. when adding the librespot `streaming` scope on v0.2)
+/// and force a one-time re-authorization instead of letting playback
+/// silently fail with "Premium required" errors that are actually
+/// "wrong scope" errors.
+pub fn token_has_all_scopes(tok: &rspotify::Token) -> bool {
+    let need = required_scopes();
+    need.iter().all(|s| tok.scopes.contains(s))
 }
 
 fn token_cache_path() -> PathBuf {

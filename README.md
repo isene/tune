@@ -6,7 +6,9 @@
 
 ![Rust](https://img.shields.io/badge/language-Rust-f74c00) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
-Terminal controller for Spotify. Search, browse playlists and saved tracks, queue items, switch devices, drive playback (play / pause / next / prev / seek / volume / shuffle / repeat). No audio backend — tune is a Spotify Connect *controller*, so playback happens on whatever device you've authorized (your phone, your desktop Spotify, a speaker, the web player). Built on [crust](https://github.com/isene/crust). Part of the [Fe₂O₃ Rust terminal suite](https://github.com/isene/fe2o3).
+Terminal controller for Spotify, *and* a Spotify Connect device. Search, browse playlists and saved tracks, queue items, switch devices, drive playback (play / pause / next / prev / seek / volume / shuffle / repeat). tune registers itself as a Spotify Connect endpoint via [librespot](https://github.com/librespot-org/librespot) — so audio plays right out of the same binary on whichever machine you launched it on — but it can also drive any *other* Connect device on your account (phone, desktop client, web player, smart speaker). Built on [crust](https://github.com/isene/crust). Part of the [Fe₂O₃ Rust terminal suite](https://github.com/isene/fe2o3).
+
+**Requires a Spotify Premium account.** librespot's audio stream requests are gated behind Premium; controller-only mode (search, browse, transport on *other* devices) still works for free accounts.
 
 ## Setup (one time, ~2 min)
 
@@ -75,9 +77,8 @@ ln -s "$(pwd)/target/release/tune" ~/bin/tune
 
 ## What you can't do
 
-- **Stream audio.** tune is a Connect controller — it tells Spotify what to play, on which device. Playing on the local machine itself requires the Spotify Linux desktop client (or `librespot`) to be running there.
 - **Edit playlists.** Currently read-only; add/remove/reorder lives behind a future scope grant.
-- **Free-tier accounts.** Spotify gates most playback-modify endpoints behind Premium. Search and library browsing work, but transport calls will return 403.
+- **Free-tier accounts.** Spotify gates audio streaming AND most playback-modify endpoints behind Premium. Search and library browsing work, but transport calls return 403.
 
 ## Config
 
@@ -87,9 +88,21 @@ ln -s "$(pwd)/target/release/tune" ~/bin/tune
 client_id: "<your spotify developer client id>"
 poll_s: 2                 # now-playing refresh cadence, seconds
 default_device: ""        # preferred device id; empty = last-used
+local_player: true        # register tune itself as a Spotify Connect device
+device_name: "tune"       # name shown in Spotify Connect picker
 ```
 
 Token cache: `~/.tune/token.json` (refresh token + access token; auto-refreshed when stale). Delete the file to force re-authorization (e.g. after adding a new scope).
+
+### Battery-drain profile
+
+tune is built to be quiet on a laptop:
+
+- **Idle (nothing playing):** librespot keeps a long-lived TCP keep-alive to Spotify's access-point server (one packet every ~30 s), the now-playing pane polls the Web API every `poll_s` seconds (default 2 s, one tiny request). Audio backend's sink suspends. CPU near zero, no audio device wakeups.
+- **Playing:** ogg/vorbis decode + pulseaudio write. Single-digit CPU% on any modern laptop.
+- **Paused:** same as idle.
+
+mDNS-based discovery (which would broadcast periodically) is **off by default** — tune authenticates via OAuth, so it doesn't need to advertise itself on the LAN. The librespot `with-libmdns` / `with-avahi` features are disabled.
 
 ## Part of the Rust Terminal Suite (Fe₂O₃)
 

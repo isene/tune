@@ -7,6 +7,7 @@
 
 mod auth;
 mod config;
+mod player;
 
 use crust::{Crust, Cursor, Input, Pane, style};
 use rspotify::{AuthCodePkceSpotify};
@@ -905,14 +906,48 @@ fn main() {
     }
 
     let mut spotify = auth::build_client(&cfg.client_id);
-    // Try cached token first; only run the browser flow if there is none.
+    // Try cached token first. Re-authorize when the cache predates
+    // a scope addition (e.g. `streaming`, added when librespot
+    // landed) so the user doesn't hit a "Premium required" 403 on
+    // a track stream that's really a missing-scope problem.
     let cached = spotify.read_token_cache(true).ok().flatten();
-    if let Some(tok) = cached {
+    let need_reauth = match &cached {
+        Some(tok) => !auth::token_has_all_scopes(tok),
+        None => true,
+    };
+    if need_reauth {
+        if cached.is_some() {
+            eprintln!("tune: cached token is missing newly-required scopes; \
+                       re-authorizing once.");
+        }
+        if let Err(e) = auth::authorize(&mut spotify) {
+            eprintln!("Authorization failed: {}", e);
+            std::process::exit(1);
+        }
+    } else if let Some(tok) = cached {
         *spotify.get_token().lock().unwrap() = Some(tok);
-    } else if let Err(e) = auth::authorize(&mut spotify) {
-        eprintln!("Authorization failed: {}", e);
-        std::process::exit(1);
     }
+
+    // Spawn the librespot Spirc session BEFORE entering the TUI so
+    // any auth/audio-backend errors print to stderr (the alt-screen
+    // would otherwise swallow them). The handle is held for the
+    // lifetime of main(); dropping it on quit tears down Spirc and
+    // de-registers the device from Spotify Connect.
+    let _local_player = if cfg.local_player {
+        let access_token = spotify.get_token()
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|t| t.access_token.clone()))
+            .unwrap_or_default();
+        if access_token.is_empty() {
+            eprintln!("tune: no access token available, skipping local player.");
+            None
+        } else {
+            Some(player::LocalPlayer::start(access_token, cfg.device_name.clone()))
+        }
+    } else {
+        None
+    };
 
     Crust::init();
     Crust::set_app_identity("Tune");
