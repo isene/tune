@@ -99,14 +99,17 @@ struct App {
     cover_track_id: Option<String>,
 }
 
-/// Height of the now-playing strip in rows. 10 rows of cover height
-/// at typical 8×16-pixel terminal cells = 160 px tall. Paired with
-/// COVER_W below to keep the thumbnail roughly square.
-const NOW_H: u16 = 10;
-/// Cover thumbnail width in cells. 20 cells × 8 px ≈ 160 px wide
-/// (roughly square at typical cell aspect ratios — terminal cells
-/// are ~1:2, so 20w × 10h cells maps to a near-square pixel box).
-const COVER_W: u16 = 20;
+/// Height of the now-playing strip in rows. Spotify covers are
+/// square (640 × 640); glow scales the image to fit the (cells_w ×
+/// cell_px_w, cells_h × cell_px_h) bounding box while preserving
+/// aspect. With typical terminal cells around 8 × 22 px (taller
+/// than wide), WIDTH dominates — so growing COVER_W gets us a
+/// bigger cover, and we size NOW_H to fit the resulting square.
+/// 30 cells × 8 px ≈ 240 px wide → 240 px tall image → ~11 cells
+/// tall, so NOW_H = 14 leaves a small margin below for breathing.
+const NOW_H: u16 = 14;
+/// Cover thumbnail width in cells. See NOW_H comment.
+const COVER_W: u16 = 30;
 /// Left padding before the cover. Starting at col 2 leaves a one-
 /// cell gutter against the terminal edge instead of butting the
 /// art straight up against the frame.
