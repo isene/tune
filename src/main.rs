@@ -99,13 +99,14 @@ struct App {
     cover_track_id: Option<String>,
 }
 
-/// Height of the now-playing strip in rows. 6 leaves room for an
-/// 8-cell-wide cover thumbnail on the left (~64 × 96 px at typical
-/// 8×16 cell sizes) plus three rows of text (title / progress /
-/// volume hint).
-const NOW_H: u16 = 6;
-/// Cover thumbnail width in cells. 8 cells wide × NOW_H rows tall.
-const COVER_W: u16 = 8;
+/// Height of the now-playing strip in rows. 8 rows × 14 cells of
+/// cover artwork comes out roughly square on typical 8×16-pixel
+/// cells (112 × 128 px) — big enough to actually see the cover,
+/// small enough to leave the main pane the dominant region.
+const NOW_H: u16 = 8;
+/// Cover thumbnail width in cells. Paired with NOW_H to keep the
+/// thumbnail roughly square at typical terminal cell aspect ratios.
+const COVER_W: u16 = 14;
 
 impl App {
     fn new(spotify: AuthCodePkceSpotify, poll_s: u64, default_device: String) -> Self {
@@ -1329,11 +1330,12 @@ fn main() {
     app.render_all();
 
     loop {
-        // 250 ms input timeout: short enough that the 1-second
-        // progress tick fires within ~1 s of when it's due, long
-        // enough that idle CPU stays cold (4 wakes/s vs 100s of
-        // wakes/s for a tighter loop).
-        if let Some(key) = Input::getchr(Some(250)) {
+        // 1-second input timeout. crust's `Input::getchr` parameter
+        // is `Option<u64>` of SECONDS (not ms — easy mistake), so 1
+        // is the minimum tick granularity without bypassing crust.
+        // That's exactly what the progress bar wants: wake every
+        // second, run tick_progress, re-render the now-strip.
+        if let Some(key) = Input::getchr(Some(1)) {
             if app.handle(&key) { break; }
         }
         app.poll_state();      // Web API (every poll_interval s)
