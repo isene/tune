@@ -67,10 +67,13 @@ struct App {
     devices:          Vec<Device>,
     devices_idx:      usize,
     devices_loaded_at: Option<std::time::Instant>,
+    /// Config-supplied preferred device — matched by name or id. Empty
+    /// = "no preference, pick whatever Spotify has active".
+    default_device: String,
 }
 
 impl App {
-    fn new(spotify: AuthCodePkceSpotify, poll_s: u64) -> Self {
+    fn new(spotify: AuthCodePkceSpotify, poll_s: u64, default_device: String) -> Self {
         let (cols, rows) = Crust::terminal_size();
         let now_h: u16 = 4;
         let header = Pane::new(1, 1, cols, 1, t::FG_BRIGHT as u16, t::BG_BAR as u16);
@@ -104,7 +107,42 @@ impl App {
             queue: Vec::new(),          queue_idx: 0,
             devices: Vec::new(),        devices_idx: 0,
             devices_loaded_at: None,
+            default_device,
         }
+    }
+
+    /// Pick a device id for transport calls. Spotify's playback
+    /// endpoints return 404 when there's no active device AND no
+    /// `device_id` query parameter, so every play / pause / next /
+    /// seek call needs an explicit target when nothing is active.
+    /// Resolution order:
+    ///   1. Active device from current playback state, if any.
+    ///   2. Config-supplied `default_device` (matched by name first,
+    ///      then by id), if it's currently online.
+    ///   3. First device on the Spotify Connect device list.
+    ///   4. None — caller should surface a "no devices online" hint.
+    fn resolve_device_id(&mut self) -> Option<String> {
+        if let Some(pb) = &self.playback {
+            if let Some(id) = pb.device.id.clone() {
+                return Some(id);
+            }
+        }
+        // Refresh the device list at most every 30 s; an inactive
+        // pick made off a stale snapshot would 404 anyway.
+        let stale = self.devices_loaded_at
+            .map(|t| t.elapsed().as_secs() > 30)
+            .unwrap_or(true);
+        if stale { self.load_devices(); }
+        if !self.default_device.is_empty() {
+            if let Some(d) = self.devices.iter().find(|d|
+                d.name == self.default_device
+                || d.id.as_deref() == Some(&self.default_device))
+            {
+                if let Some(id) = d.id.clone() { return Some(id); }
+            }
+        }
+        self.devices.iter().find(|d| d.is_active).and_then(|d| d.id.clone())
+            .or_else(|| self.devices.first().and_then(|d| d.id.clone()))
     }
 
     fn render_all(&mut self) {
@@ -621,10 +659,18 @@ impl App {
                 let pl  = self.open_playlist.clone();
                 let idx = self.playlist_tracks_idx;
                 if let Some(pl) = pl {
+                    let Some(device_id) = self.resolve_device_id() else {
+                        self.set_status(
+                            "No Spotify Connect devices online — open Spotify on a phone or desktop first.",
+                            t::AMBER);
+                        return;
+                    };
                     let ctx = PlayContextId::Playlist(pl.id.clone_static());
                     let offset = Some(rspotify::model::Offset::Position(
                         chrono::Duration::milliseconds(idx as i64)));
-                    match self.spotify.start_context_playback(ctx, None, offset, None) {
+                    match self.spotify.start_context_playback(
+                        ctx, Some(&device_id), offset, None)
+                    {
                         Ok(_)  => self.set_status(
                             &format!("Playing from #{}", idx + 1), t::OK),
                         Err(e) => self.set_status(
@@ -646,9 +692,15 @@ impl App {
             }
             View::Search | View::Saved | View::Queue => {
                 if let Some(id) = self.current_track_uri() {
+                    let Some(device_id) = self.resolve_device_id() else {
+                        self.set_status(
+                            "No Spotify Connect devices online — open Spotify on a phone or desktop first.",
+                            t::AMBER);
+                        return;
+                    };
                     let uri = rspotify::model::PlayableId::Track(id);
                     match self.spotify.start_uris_playback(
-                        std::iter::once(uri), None, None, None) {
+                        std::iter::once(uri), Some(&device_id), None, None) {
                         Ok(_)  => self.set_status("Playing", t::OK),
                         Err(e) => self.set_status(&format!("Play failed: {}", e), t::ERR),
                     }
@@ -662,19 +714,34 @@ impl App {
 
     fn queue_current(&mut self) {
         let Some(id) = self.current_track_uri() else { return };
+        let device_id = self.resolve_device_id();
         let uri = rspotify::model::PlayableId::Track(id);
-        match self.spotify.add_item_to_queue(uri, None) {
+        match self.spotify.add_item_to_queue(uri, device_id.as_deref()) {
             Ok(_)  => self.set_status("Added to queue", t::OK),
             Err(e) => self.set_status(&format!("Queue failed: {}", e), t::ERR),
         }
     }
 
     fn toggle_play(&mut self) {
+        let Some(device_id) = self.resolve_device_id() else {
+            self.set_status(
+                "No Spotify Connect devices online — open Spotify on a phone or desktop first.",
+                t::AMBER);
+            return;
+        };
         let playing = self.playback.as_ref().map(|p| p.is_playing).unwrap_or(false);
+        let active_id = self.playback.as_ref().and_then(|p| p.device.id.clone());
         let r = if playing {
-            self.spotify.pause_playback(None)
+            self.spotify.pause_playback(Some(&device_id))
+        } else if active_id.is_some() {
+            // Active device → just resume what was paused.
+            self.spotify.resume_playback(Some(&device_id), None)
         } else {
-            self.spotify.resume_playback(None, None)
+            // No active device: transferring with play=true activates
+            // the picked device AND starts playback in one call. This
+            // is the path used after a fresh tune launch when nothing
+            // is playing anywhere.
+            self.spotify.transfer_playback(&device_id, Some(true))
         };
         match r {
             Ok(_)  => {}
@@ -685,12 +752,14 @@ impl App {
     }
 
     fn skip_next(&mut self) {
-        let _ = self.spotify.next_track(None);
+        let device_id = self.resolve_device_id();
+        let _ = self.spotify.next_track(device_id.as_deref());
         self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
         self.poll_state();
     }
     fn skip_prev(&mut self) {
-        let _ = self.spotify.previous_track(None);
+        let device_id = self.resolve_device_id();
+        let _ = self.spotify.previous_track(device_id.as_deref());
         self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
         self.poll_state();
     }
@@ -700,7 +769,8 @@ impl App {
             .and_then(|p| p.device.volume_percent.map(|v| v as i32))
             .unwrap_or(50);
         let new = (cur + delta).clamp(0, 100) as u8;
-        let _ = self.spotify.volume(new, None);
+        let device_id = self.resolve_device_id();
+        let _ = self.spotify.volume(new, device_id.as_deref());
         self.set_status(&format!("Volume: {}%", new), t::OK);
         // Reflect immediately
         if let Some(ref mut pb) = self.playback {
@@ -719,14 +789,17 @@ impl App {
             _ => 0,
         };
         let target = (cur + delta_ms).clamp(0, total.max(0));
-        let _ = self.spotify.seek_track(chrono::Duration::milliseconds(target), None);
+        let device_id = self.resolve_device_id();
+        let _ = self.spotify.seek_track(
+            chrono::Duration::milliseconds(target), device_id.as_deref());
         self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
         self.poll_state();
     }
 
     fn toggle_shuffle(&mut self) {
         let cur = self.playback.as_ref().map(|p| p.shuffle_state).unwrap_or(false);
-        let _ = self.spotify.shuffle(!cur, None);
+        let device_id = self.resolve_device_id();
+        let _ = self.spotify.shuffle(!cur, device_id.as_deref());
         self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
         self.poll_state();
     }
@@ -737,7 +810,8 @@ impl App {
             RepeatState::Context => RepeatState::Track,
             RepeatState::Track   => RepeatState::Off,
         };
-        let _ = self.spotify.repeat(next, None);
+        let device_id = self.resolve_device_id();
+        let _ = self.spotify.repeat(next, device_id.as_deref());
         self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
         self.poll_state();
     }
@@ -843,7 +917,7 @@ fn main() {
     Crust::init();
     Crust::set_app_identity("Tune");
     Crust::clear_screen();
-    let mut app = App::new(spotify, cfg.poll_s);
+    let mut app = App::new(spotify, cfg.poll_s, cfg.default_device);
     app.poll_state();
     app.render_all();
 
