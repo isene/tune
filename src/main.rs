@@ -13,10 +13,19 @@ use crust::{Crust, Cursor, Input, Pane, style};
 use rspotify::{AuthCodePkceSpotify};
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::model::{
-    AdditionalType, Country, CurrentPlaybackContext, Device, FullTrack, Market,
-    PlayableItem, PlayContextId, RepeatState, SearchResult, SearchType,
+    AdditionalType, Country, CurrentPlaybackContext, Device, FullArtist, FullTrack,
+    Market, PlayableItem, PlayContextId, RepeatState, SearchResult, SearchType,
     SimplifiedPlaylist,
 };
+
+/// One row in the Search results list. Artists and tracks both show
+/// up in the same scrollable list (artists first so the user can
+/// drill into them); ENTER dispatches per-variant.
+#[derive(Debug, Clone)]
+enum SearchRow {
+    Artist(FullArtist),
+    Track(FullTrack),
+}
 use rspotify::model::idtypes::Id;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -54,7 +63,7 @@ struct App {
 
     // List state per view (selected row + items)
     search_query:     String,
-    search_results:   Vec<FullTrack>,
+    search_results:   Vec<SearchRow>,
     search_idx:       usize,
     playlists:        Vec<SimplifiedPlaylist>,
     playlists_idx:    usize,
@@ -177,7 +186,7 @@ impl App {
         let pad_w = (self.cols as usize)
             .saturating_sub(crust::display_width(&left) + crust::display_width(&right));
         self.header.set_text(&format!("{}{}{}", left, " ".repeat(pad_w), right));
-        self.header.full_refresh();
+        self.header.refresh();
     }
 
     fn render_main(&mut self) {
@@ -192,7 +201,34 @@ impl App {
             View::Help            => self.lines_help(&mut lines),
         }
         self.main_p.set_text(&lines.join("\n"));
-        self.main_p.full_refresh();
+        // Adjust scroll so the selected row stays in view with a
+        // 3-row scrolloff (vim convention). Then diff-render via
+        // refresh() — full_refresh wipes the pane and causes flicker
+        // every keystroke on long lists.
+        self.adjust_main_scroll();
+        self.main_p.refresh();
+    }
+
+    /// Keep the selected list row within `SCROLLOFF` rows of the
+    /// viewport edges. Each `lines_*` view emits three header rows
+    /// (blank / title / blank) before the list rows, so the visual
+    /// row index of the selected item is `LIST_HEADER_OFFSET +
+    /// list_idx`.
+    fn adjust_main_scroll(&mut self) {
+        const SCROLLOFF: usize = 3;
+        const HEADER_OFFSET: usize = 3;
+        let h = self.main_p.h as usize;
+        if h == 0 { return; }
+        let (idx, len) = self.current_list_indices();
+        if len.is_none() { return; } // help view — no list
+        let target = HEADER_OFFSET + idx;
+        let top = self.main_p.ix;
+        let bot = top + h.saturating_sub(1);
+        if target < top + SCROLLOFF {
+            self.main_p.ix = target.saturating_sub(SCROLLOFF);
+        } else if target + SCROLLOFF > bot {
+            self.main_p.ix = (target + SCROLLOFF + 1).saturating_sub(h);
+        }
     }
 
     fn render_now(&mut self) {
@@ -216,6 +252,14 @@ impl App {
                         e.name.clone(),
                         e.show.name.clone(),
                     ),
+                    // PlayableItem::Unknown captures the raw JSON
+                    // verbatim when rspotify's strict Track/Episode
+                    // deserialization fails (frequent enough in 0.16
+                    // that rspotify added Unknown specifically for
+                    // this — see ramsayleung/rspotify#525). The
+                    // shape is still standard Spotify, so we can
+                    // pull name + artists + duration ourselves.
+                    Some(PlayableItem::Unknown(j)) => unknown_title_artists(j),
                     _ => ("—".to_string(), "—".to_string()),
                 };
                 let playing = pb.is_playing;
@@ -225,6 +269,7 @@ impl App {
                 let total_ms = match &pb.item {
                     Some(PlayableItem::Track(t))   => t.duration.num_milliseconds() as u64,
                     Some(PlayableItem::Episode(e)) => e.duration.num_milliseconds() as u64,
+                    Some(PlayableItem::Unknown(j)) => unknown_duration_ms(j),
                     _ => 0,
                 };
                 let bar = progress_bar(progress_ms, total_ms,
@@ -248,8 +293,7 @@ impl App {
             }
         }
         self.now_p.set_text(&lines.join("\n"));
-        self.now_p.border_refresh();
-        self.now_p.full_refresh();
+        self.now_p.refresh();
     }
 
     fn render_footer(&mut self) {
@@ -261,7 +305,7 @@ impl App {
             ),
         };
         self.footer.set_text(&style::fg(&msg, col));
-        self.footer.full_refresh();
+        self.footer.refresh();
     }
 
     fn set_status(&mut self, msg: &str, color: u8) {
@@ -363,8 +407,12 @@ impl App {
                     style::fg(&self.search_query, t::FG))
             }));
         out.push(String::new());
-        for (i, t) in self.search_results.iter().enumerate() {
-            out.push(track_row(t, i == self.search_idx));
+        for (i, row) in self.search_results.iter().enumerate() {
+            let selected = i == self.search_idx;
+            out.push(match row {
+                SearchRow::Artist(a) => artist_row(a, selected),
+                SearchRow::Track(t)  => track_row(t, selected),
+            });
         }
         if self.search_results.is_empty() && !self.search_query.is_empty() {
             out.push(format!("  {}", style::fg("(no results)", t::FG_DIM)));
@@ -537,14 +585,19 @@ impl App {
         let was = self.view;
         match key {
             // ---- view switching ----
-            "?"  => { self.view = View::Help; }
-            "/"  => { self.view = View::Search; self.search_prompt(); }
-            "P"  => { self.view = View::Playlists; self.ensure_playlists_loaded(); }
-            "L"  => { self.view = View::Saved; self.ensure_saved_loaded(); }
-            "Q"  => { self.view = View::Queue; self.ensure_queue_loaded(); }
-            "d"  => { self.view = View::Devices; self.load_devices(); }
+            "?"  => { self.view = View::Help;       self.main_p.ix = 0; }
+            "/"  => { self.view = View::Search;     self.main_p.ix = 0;
+                      self.search_prompt(); }
+            "P"  => { self.view = View::Playlists;  self.main_p.ix = 0;
+                      self.ensure_playlists_loaded(); }
+            "L"  => { self.view = View::Saved;      self.main_p.ix = 0;
+                      self.ensure_saved_loaded(); }
+            "Q"  => { self.view = View::Queue;      self.main_p.ix = 0;
+                      self.ensure_queue_loaded(); }
+            "d"  => { self.view = View::Devices;    self.main_p.ix = 0;
+                      self.load_devices(); }
             "h" if self.view == View::PlaylistTracks => {
-                self.view = View::Playlists;
+                self.view = View::Playlists;        self.main_p.ix = 0;
             }
             // ---- list navigation ----
             "j" | "DOWN" => self.list_down(),
@@ -583,18 +636,33 @@ impl App {
         let q = q.trim().to_string();
         if q.is_empty() { return; }
         self.search_query = q.clone();
-        // Spotify capped Search API `limit` to 10 (down from 50) in
-        // Feb 2026 — passing 30 returns 400 Bad Request.
-        match self.spotify.search(&q, SearchType::Track,
-                                  Some(Market::Country(Country::Norway)),
+        // Spotify capped the Search API `limit` to 10 (down from 50)
+        // in Feb 2026 — passing more returns 400 Bad Request. We do
+        // two narrow calls (Artist + Track) and stitch them so the
+        // user sees both kinds in one list, artists first (smaller
+        // count, prominent).
+        let market = Some(Market::Country(Country::Norway));
+        let mut rows: Vec<SearchRow> = Vec::new();
+        match self.spotify.search(&q, SearchType::Artist, market.clone(),
+                                  None, Some(5), None) {
+            Ok(SearchResult::Artists(p)) => {
+                for a in p.items { rows.push(SearchRow::Artist(a)); }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.set_status(&format!("Search (artists) failed: {}", e), t::ERR);
+            }
+        }
+        match self.spotify.search(&q, SearchType::Track, market,
                                   None, Some(10), None) {
             Ok(SearchResult::Tracks(p)) => {
-                self.search_results = p.items;
-                self.search_idx = 0;
+                for t in p.items { rows.push(SearchRow::Track(t)); }
             }
             Ok(_) => self.set_status("Unexpected response shape", t::ERR),
             Err(e) => self.set_status(&format!("Search failed: {}", e), t::ERR),
         }
+        self.search_results = rows;
+        self.search_idx = 0;
         self.render_footer();
     }
 
@@ -637,7 +705,10 @@ impl App {
 
     fn current_track_uri(&self) -> Option<rspotify::model::TrackId<'static>> {
         let t = match self.view {
-            View::Search         => self.search_results.get(self.search_idx),
+            View::Search         => match self.search_results.get(self.search_idx)? {
+                SearchRow::Track(t)  => Some(t),
+                SearchRow::Artist(_) => None,
+            },
             View::PlaylistTracks => self.playlist_tracks.get(self.playlist_tracks_idx),
             View::Saved          => self.saved_tracks.get(self.saved_idx),
             View::Queue          => self.queue.get(self.queue_idx),
@@ -694,7 +765,44 @@ impl App {
                     }
                 }
             }
-            View::Search | View::Saved | View::Queue => {
+            View::Search => {
+                let Some(device_id) = self.resolve_device_id() else {
+                    self.set_status(
+                        "No Spotify Connect devices online — open Spotify on a phone or desktop first.",
+                        t::AMBER);
+                    return;
+                };
+                match self.search_results.get(self.search_idx).cloned() {
+                    Some(SearchRow::Track(t)) => {
+                        if let Some(id) = t.id.clone() {
+                            let uri = rspotify::model::PlayableId::Track(
+                                id.clone_static());
+                            match self.spotify.start_uris_playback(
+                                std::iter::once(uri), Some(&device_id), None, None) {
+                                Ok(_)  => self.set_status("Playing", t::OK),
+                                Err(e) => self.set_status(
+                                    &format!("Play failed: {}", e), t::ERR),
+                            }
+                        }
+                    }
+                    Some(SearchRow::Artist(a)) => {
+                        // Play the artist's "essentials" radio (top
+                        // tracks + similar) — Spotify resolves this
+                        // from the artist context_uri.
+                        let ctx = PlayContextId::Artist(a.id.clone_static());
+                        match self.spotify.start_context_playback(
+                            ctx, Some(&device_id), None, None)
+                        {
+                            Ok(_)  => self.set_status(
+                                &format!("Playing {}", a.name), t::OK),
+                            Err(e) => self.set_status(
+                                &format!("Play failed: {}", e), t::ERR),
+                        }
+                    }
+                    None => {}
+                }
+            }
+            View::Saved | View::Queue => {
                 if let Some(id) = self.current_track_uri() {
                     let Some(device_id) = self.resolve_device_id() else {
                         self.set_status(
@@ -790,6 +898,7 @@ impl App {
         let total = match self.playback.as_ref().and_then(|p| p.item.as_ref()) {
             Some(PlayableItem::Track(t))   => t.duration.num_milliseconds(),
             Some(PlayableItem::Episode(e)) => e.duration.num_milliseconds(),
+            Some(PlayableItem::Unknown(j)) => unknown_duration_ms(j) as i64,
             _ => 0,
         };
         let target = (cur + delta_ms).clamp(0, total.max(0));
@@ -851,6 +960,51 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+fn artist_row(a: &FullArtist, selected: bool) -> String {
+    let cursor = if selected { "▸" } else { " " };
+    let followers = a.followers.total;
+    let genres = a.genres.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
+    let label = if genres.is_empty() { "artist".to_string() } else { genres };
+    let line = format!("  {}  {:<40}  {:<28}  {} followers",
+        cursor,
+        truncate(&format!("♪ {}", a.name), 40),
+        truncate(&label, 28),
+        human_count(followers));
+    if selected {
+        style::bold(&style::fg(&line, t::FG_BRIGHT)).to_string()
+    } else {
+        style::fg(&line, t::CYAN).to_string()
+    }
+}
+
+/// "12,345" → "12k", "1,234,567" → "1.2M". Quick approx; rounds down.
+fn human_count(n: u32) -> String {
+    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
+    else if n >= 1_000 { format!("{}k", n / 1_000) }
+    else { n.to_string() }
+}
+
+/// Pull `name` + comma-joined `artists[].name` from a raw
+/// `PlayableItem::Unknown` JSON value. Shape matches the Spotify
+/// Web API track object — we only need three fields so we don't
+/// repeat rspotify's full deserialization, just walk the JSON tree.
+fn unknown_title_artists(j: &serde_json::Value) -> (String, String) {
+    let title = j.get("name").and_then(|v| v.as_str())
+        .map(|s| s.to_string()).unwrap_or_else(|| "—".into());
+    let artists = j.get("artists").and_then(|v| v.as_array())
+        .map(|arr| arr.iter()
+            .filter_map(|a| a.get("name").and_then(|n| n.as_str()))
+            .collect::<Vec<_>>()
+            .join(", "))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "—".into());
+    (title, artists)
+}
+
+fn unknown_duration_ms(j: &serde_json::Value) -> u64 {
+    j.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
 fn fmt_ms(ms: u64) -> String {
     let secs = ms / 1000;
     let m = secs / 60;
@@ -887,6 +1041,40 @@ mod t {
 // ---- Main ---------------------------------------------------------
 
 fn main() {
+    // Trivial CLI surface — kept tiny on purpose so we don't grow an
+    // arg parser. Other args fall through to TUI mode (with the
+    // is_tty guard below catching cases where it shouldn't).
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--version" | "-V" | "-v" => {
+                println!("tune {}", VERSION);
+                return;
+            }
+            "--help" | "-h" => {
+                println!("tune {} — Spotify Connect controller TUI", VERSION);
+                println!();
+                println!("Usage: tune");
+                println!();
+                println!("First run prompts for a Spotify Developer client ID");
+                println!("(see https://developer.spotify.com/dashboard), then opens");
+                println!("the browser for the one-time OAuth grant. Press ? inside");
+                println!("the TUI for the key reference.");
+                return;
+            }
+            _ => {}
+        }
+    }
+    // Refuse to launch the alt-screen TUI if stdin isn't a terminal —
+    // otherwise the input loop spins on failed reads and burns
+    // thousands of wakeups per second (one observed at 2255 wakes/s
+    // in a stray `tune --version` that fell through to TUI mode
+    // without a TTY). Battery first.
+    if unsafe { libc::isatty(0) } == 0 {
+        eprintln!("tune: stdin is not a terminal — refusing to start the TUI.");
+        eprintln!("Run `tune` interactively, or `tune --help` for usage.");
+        std::process::exit(1);
+    }
+
     let mut cfg = config::load();
     if cfg.client_id.trim().is_empty() {
         config::print_setup_instructions();
