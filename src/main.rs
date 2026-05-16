@@ -10,6 +10,8 @@ mod config;
 mod player;
 
 use crust::{Crust, Cursor, Input, Pane, style};
+use glow::Display;
+use std::path::PathBuf;
 use rspotify::{AuthCodePkceSpotify};
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::model::{
@@ -50,6 +52,13 @@ struct App {
     playback: Option<CurrentPlaybackContext>,
     last_poll: std::time::Instant,
     poll_interval: std::time::Duration,
+    /// Last wall-clock instant at which we re-rendered the
+    /// now-playing strip with a locally-extrapolated progress value.
+    /// Lets the progress bar tick every ~1 s without hitting the
+    /// Spotify Web API (which we still poll every `poll_interval`
+    /// seconds for ground-truth resync). Battery cheap: no network,
+    /// no syscalls, just a stdout diff write to the 4-row pane.
+    last_progress_tick: std::time::Instant,
 
     // UI
     header: Pane,
@@ -80,16 +89,35 @@ struct App {
     /// Config-supplied preferred device — matched by name or id. Empty
     /// = "no preference, pick whatever Spotify has active".
     default_device: String,
+
+    /// glow renderer for the album cover thumbnail rendered in the
+    /// left edge of the now-playing strip. Lazy-init on first show so
+    /// a Connect-only session (no playback yet) doesn't probe kitty /
+    /// sixel / chafa at startup. `cover_track_id` is the currently-
+    /// displayed track id; we re-download + re-place only on change.
+    cover_display:  Option<Display>,
+    cover_track_id: Option<String>,
 }
+
+/// Height of the now-playing strip in rows. 6 leaves room for an
+/// 8-cell-wide cover thumbnail on the left (~64 × 96 px at typical
+/// 8×16 cell sizes) plus three rows of text (title / progress /
+/// volume hint).
+const NOW_H: u16 = 6;
+/// Cover thumbnail width in cells. 8 cells wide × NOW_H rows tall.
+const COVER_W: u16 = 8;
 
 impl App {
     fn new(spotify: AuthCodePkceSpotify, poll_s: u64, default_device: String) -> Self {
         let (cols, rows) = Crust::terminal_size();
-        let now_h: u16 = 4;
         let header = Pane::new(1, 1, cols, 1, t::FG_BRIGHT as u16, t::BG_BAR as u16);
-        let main_p = Pane::new(1, 2, cols, rows.saturating_sub(2 + now_h + 1),
+        let main_p = Pane::new(1, 2, cols, rows.saturating_sub(2 + NOW_H + 1),
                                t::FG as u16, 0);
-        let now_p  = Pane::new(1, rows - now_h, cols, now_h, t::FG_BRIGHT as u16, t::BG_NOW as u16);
+        // now-pane content area starts past the cover thumbnail, so
+        // the text doesn't overdraw the kitty placement.
+        let now_p  = Pane::new(COVER_W + 2, rows - NOW_H,
+                               cols.saturating_sub(COVER_W + 2),
+                               NOW_H, t::FG_BRIGHT as u16, t::BG_NOW as u16);
         let footer = Pane::new(1, rows, cols, 1, t::FG as u16, t::BG_BAR as u16);
         let mut header = header; header.wrap = false; header.scroll = false;
         let mut footer = footer; footer.wrap = false; footer.scroll = false;
@@ -104,6 +132,7 @@ impl App {
             playback: None,
             last_poll: std::time::Instant::now() - std::time::Duration::from_secs(60),
             poll_interval: std::time::Duration::from_secs(poll_s.max(1)),
+            last_progress_tick: std::time::Instant::now(),
             header, main_p, now_p, footer,
             cols, rows,
             view: View::Search,
@@ -118,6 +147,8 @@ impl App {
             devices: Vec::new(),        devices_idx: 0,
             devices_loaded_at: None,
             default_device,
+            cover_display: None,
+            cover_track_id: None,
         }
     }
 
@@ -319,12 +350,89 @@ impl App {
 
     // ---- Polling ----------------------------------------------------
 
+    /// Extrapolate the playback `progress` by the wall-clock time
+    /// since the last extrapolation, re-render the now-playing
+    /// strip, and reset the timestamp. Skipped if less than 1 s has
+    /// passed, if nothing is playing, or if the track is paused.
+    ///
+    /// The API poll (every `poll_interval` s) is the ground truth —
+    /// it overwrites `progress` with whatever Spotify reports. The
+    /// local tick only fills in the gap between polls so the
+    /// progress bar visibly moves.
+    /// Download (cache-aware) and place the album cover for the
+    /// currently playing track. Called from `poll_state` after the
+    /// API gives us the item details. Skipped if the same track id
+    /// is still showing.
+    fn sync_cover(&mut self) {
+        let (track_id, url) = match self.playback.as_ref().and_then(|pb| pb.item.as_ref()) {
+            Some(item) => match cover_id_and_url(item) {
+                Some(pair) => pair,
+                None => { self.clear_cover(); return; }
+            },
+            None => { self.clear_cover(); return; }
+        };
+        if self.cover_track_id.as_deref() == Some(track_id.as_str()) { return; }
+        let cache_path = cover_cache_path(&track_id);
+        if !cache_path.exists() {
+            if let Err(e) = download_cover(&url, &cache_path) {
+                eprintln!("cover download failed for {}: {}", track_id, e);
+                return;
+            }
+        }
+        let (_, rows) = Crust::terminal_size();
+        let display = self.cover_display.get_or_insert_with(Display::new);
+        // Place at (col 1, row rows - NOW_H + 1) — left edge of the
+        // now-playing strip, in the first row. show() sizes to
+        // (COVER_W × NOW_H) cells; the image is scaled to fit.
+        let placed = display.show(
+            &cache_path.to_string_lossy(),
+            1, rows.saturating_sub(NOW_H) + 1,
+            COVER_W, NOW_H);
+        if placed { self.cover_track_id = Some(track_id); }
+    }
+
+    fn clear_cover(&mut self) {
+        if self.cover_track_id.is_none() { return; }
+        let (_, rows) = Crust::terminal_size();
+        if let Some(d) = self.cover_display.as_mut() {
+            let (cols, _) = Crust::terminal_size();
+            d.clear(1, rows.saturating_sub(NOW_H) + 1, COVER_W, NOW_H,
+                    cols, rows);
+        }
+        self.cover_track_id = None;
+    }
+
+    fn tick_progress(&mut self) {
+        let elapsed = self.last_progress_tick.elapsed();
+        if elapsed < std::time::Duration::from_secs(1) { return; }
+        self.last_progress_tick = std::time::Instant::now();
+        let is_playing = self.playback.as_ref().map(|p| p.is_playing).unwrap_or(false);
+        if !is_playing { return; }
+        if let Some(pb) = self.playback.as_mut() {
+            if let Some(p) = pb.progress {
+                let bump = chrono::Duration::from_std(elapsed).unwrap_or_default();
+                pb.progress = Some(p + bump);
+            }
+        }
+        self.render_now();
+    }
+
     fn poll_state(&mut self) {
         if self.last_poll.elapsed() < self.poll_interval { return; }
         self.last_poll = std::time::Instant::now();
         let additional = &[AdditionalType::Track, AdditionalType::Episode];
         match self.spotify.current_playback(None, Some(additional)) {
-            Ok(pb) => { self.playback = pb; self.render_header(); self.render_now(); }
+            Ok(pb) => {
+                self.playback = pb;
+                // API replaced `progress` with ground truth — restart
+                // the local tick window from now so the next
+                // extrapolation doesn't double-count the time that
+                // elapsed during the API call.
+                self.last_progress_tick = std::time::Instant::now();
+                self.render_header();
+                self.render_now();
+                self.sync_cover();
+            }
             Err(_) => { /* transient — keep last known state */ }
         }
     }
@@ -960,28 +1068,75 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// Pick (track_id, smallest_cover_url) out of a playback item. Returns
+/// None when the item has no id or no images — both legitimate
+/// (private content, ad slot, podcast trailer with no cover).
+fn cover_id_and_url(item: &PlayableItem) -> Option<(String, String)> {
+    match item {
+        PlayableItem::Track(t) => {
+            let id = t.id.as_ref()?.id().to_string();
+            let url = t.album.images.iter()
+                .min_by_key(|i| i.width.unwrap_or(u32::MAX))
+                .map(|i| i.url.clone())?;
+            Some((id, url))
+        }
+        PlayableItem::Episode(e) => {
+            let id = e.id.id().to_string();
+            let url = e.images.iter()
+                .min_by_key(|i| i.width.unwrap_or(u32::MAX))
+                .map(|i| i.url.clone())?;
+            Some((id, url))
+        }
+        PlayableItem::Unknown(j) => {
+            let id = j.get("id").and_then(|v| v.as_str())?.to_string();
+            // Try track.album.images, then episode.images, then a
+            // bare images array as a last resort.
+            let images = j.get("album").and_then(|a| a.get("images"))
+                .or_else(|| j.get("images"))
+                .and_then(|v| v.as_array())?;
+            let url = images.iter()
+                .min_by_key(|i| i.get("width")
+                    .and_then(|w| w.as_u64()).unwrap_or(u64::MAX))
+                .and_then(|i| i.get("url").and_then(|u| u.as_str()))
+                .map(String::from)?;
+            Some((id, url))
+        }
+    }
+}
+
+fn cover_cache_path(track_id: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = PathBuf::from(home).join(".tune").join("cover_cache");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{}.jpg", track_id))
+}
+
+fn download_cover(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    let resp = ureq::get(url).call()
+        .map_err(|e| format!("GET {}: {}", url, e))?;
+    let mut body = Vec::new();
+    resp.into_reader().read_to_end(&mut body)
+        .map_err(|e| format!("read: {}", e))?;
+    std::fs::write(dest, body).map_err(|e| format!("write {:?}: {}", dest, e))
+}
+
 fn artist_row(a: &FullArtist, selected: bool) -> String {
+    // `followers` and `genres` are both flagged deprecated by
+    // rspotify (Spotify removed/changed them — see rspotify#550),
+    // so we keep the row minimal: marker + name + the literal
+    // "artist" tag so the user can tell artist rows from track
+    // rows at a glance.
     let cursor = if selected { "▸" } else { " " };
-    let followers = a.followers.total;
-    let genres = a.genres.iter().take(2).cloned().collect::<Vec<_>>().join(", ");
-    let label = if genres.is_empty() { "artist".to_string() } else { genres };
-    let line = format!("  {}  {:<40}  {:<28}  {} followers",
+    let line = format!("  {}  {:<60}  {}",
         cursor,
-        truncate(&format!("♪ {}", a.name), 40),
-        truncate(&label, 28),
-        human_count(followers));
+        truncate(&format!("♪ {}", a.name), 60),
+        style::fg("artist", t::FG_DIM));
     if selected {
         style::bold(&style::fg(&line, t::FG_BRIGHT)).to_string()
     } else {
         style::fg(&line, t::CYAN).to_string()
     }
-}
-
-/// "12,345" → "12k", "1,234,567" → "1.2M". Quick approx; rounds down.
-fn human_count(n: u32) -> String {
-    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
-    else if n >= 1_000 { format!("{}k", n / 1_000) }
-    else { n.to_string() }
 }
 
 /// Pull `name` + comma-joined `artists[].name` from a raw
@@ -1162,10 +1317,15 @@ fn main() {
     app.render_all();
 
     loop {
-        if let Some(key) = Input::getchr(Some(500)) {
+        // 250 ms input timeout: short enough that the 1-second
+        // progress tick fires within ~1 s of when it's due, long
+        // enough that idle CPU stays cold (4 wakes/s vs 100s of
+        // wakes/s for a tighter loop).
+        if let Some(key) = Input::getchr(Some(250)) {
             if app.handle(&key) { break; }
         }
-        app.poll_state();
+        app.poll_state();      // Web API (every poll_interval s)
+        app.tick_progress();   // local extrapolation (every 1 s)
         if app.handle_resize_if_needed() { app.render_all(); }
     }
     Cursor::show();
@@ -1204,14 +1364,17 @@ impl App {
         let (cols, rows) = Crust::terminal_size();
         if cols == self.cols && rows == self.rows { return false; }
         self.cols = cols; self.rows = rows;
-        let now_h: u16 = 4;
         self.header = Pane::new(1, 1, cols, 1, t::FG_BRIGHT as u16, t::BG_BAR as u16);
         self.header.wrap = false; self.header.scroll = false;
-        self.main_p = Pane::new(1, 2, cols, rows.saturating_sub(2 + now_h + 1),
+        self.main_p = Pane::new(1, 2, cols, rows.saturating_sub(2 + NOW_H + 1),
                                 t::FG as u16, 0);
-        self.now_p  = Pane::new(1, rows - now_h, cols, now_h, t::FG_BRIGHT as u16, t::BG_NOW as u16);
+        self.now_p  = Pane::new(COVER_W + 2, rows - NOW_H,
+                                cols.saturating_sub(COVER_W + 2),
+                                NOW_H, t::FG_BRIGHT as u16, t::BG_NOW as u16);
         self.now_p.wrap = false; self.now_p.scroll = false;
         self.footer = Pane::new(1, rows, cols, 1, t::FG as u16, t::BG_BAR as u16);
+        // Force re-placement of the cover after resize.
+        self.cover_track_id = None;
         self.footer.wrap = false; self.footer.scroll = false;
         Crust::clear_screen();
         true

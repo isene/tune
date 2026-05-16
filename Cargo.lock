@@ -659,6 +659,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fe2o3-glow"
+version = "0.1.11"
+dependencies = [
+ "base64",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3579,6 +3587,7 @@ dependencies = [
  "chrono",
  "env_logger",
  "fe2o3-crust",
+ "fe2o3-glow",
  "libc",
  "librespot",
  "rspotify",
