@@ -113,11 +113,12 @@ impl App {
         let header = Pane::new(1, 1, cols, 1, t::FG_BRIGHT as u16, t::BG_BAR as u16);
         let main_p = Pane::new(1, 2, cols, rows.saturating_sub(2 + NOW_H + 1),
                                t::FG as u16, 0);
-        // now-pane content area starts past the cover thumbnail, so
-        // the text doesn't overdraw the kitty placement.
-        let now_p  = Pane::new(COVER_W + 2, rows - NOW_H,
-                               cols.saturating_sub(COVER_W + 2),
-                               NOW_H, t::FG_BRIGHT as u16, t::BG_NOW as u16);
+        // now-pane spans full width — glow draws the cover at z=1
+        // (above text) so the leftmost cells of the pane bg show
+        // through everywhere the cover doesn't cover. Text content
+        // is indented past `COVER_W` cells inside render_now.
+        let now_p  = Pane::new(1, rows - NOW_H, cols, NOW_H,
+                               t::FG_BRIGHT as u16, t::BG_NOW as u16);
         let footer = Pane::new(1, rows, cols, 1, t::FG as u16, t::BG_BAR as u16);
         let mut header = header; header.wrap = false; header.scroll = false;
         let mut footer = footer; footer.wrap = false; footer.scroll = false;
@@ -263,12 +264,18 @@ impl App {
     }
 
     fn render_now(&mut self) {
+        // Indent each line past the cover thumbnail (COVER_W cells +
+        // 1 gap col). The pane spans full width so its bg fills
+        // edge-to-edge; the kitty cover image is z=1 and overlays
+        // the leftmost cells without clobbering the bg color.
+        let pad = " ".repeat(COVER_W as usize + 1);
         let mut lines: Vec<String> = Vec::new();
         lines.push(String::new());
         match &self.playback {
             None => {
-                lines.push(format!("  {}", style::fg("Nothing playing.", t::FG_DIM)));
-                lines.push(format!("  {}",
+                lines.push(format!("{}{}", pad,
+                    style::fg("Nothing playing.", t::FG_DIM)));
+                lines.push(format!("{}{}", pad,
                     style::fg("Press SPACE to resume on your last device, or `d` to pick one.",
                               t::FG_DIM)));
             }
@@ -283,13 +290,6 @@ impl App {
                         e.name.clone(),
                         e.show.name.clone(),
                     ),
-                    // PlayableItem::Unknown captures the raw JSON
-                    // verbatim when rspotify's strict Track/Episode
-                    // deserialization fails (frequent enough in 0.16
-                    // that rspotify added Unknown specifically for
-                    // this — see ramsayleung/rspotify#525). The
-                    // shape is still standard Spotify, so we can
-                    // pull name + artists + duration ourselves.
                     Some(PlayableItem::Unknown(j)) => unknown_title_artists(j),
                     _ => ("—".to_string(), "—".to_string()),
                 };
@@ -303,21 +303,25 @@ impl App {
                     Some(PlayableItem::Unknown(j)) => unknown_duration_ms(j),
                     _ => 0,
                 };
-                let bar = progress_bar(progress_ms, total_ms,
-                    (self.cols as usize).saturating_sub(20));
+                // Progress bar width = (total cols) − indent − fmt_ms slots.
+                let bar_w = (self.cols as usize)
+                    .saturating_sub(pad.len() + 20);
+                let bar = progress_bar(progress_ms, total_ms, bar_w);
                 let shuffle = if pb.shuffle_state { "🔀" } else { "  " };
                 let repeat = match pb.repeat_state {
                     RepeatState::Off => "  ",
                     RepeatState::Context => "🔁",
                     RepeatState::Track => "🔂",
                 };
-                lines.push(format!("  {} {}  {}  {}  {}",
+                lines.push(format!("{}{} {}  {}  {}  {}",
+                    pad,
                     style::fg(symbol, symcol),
                     style::bold(&style::fg(&title, t::FG_BRIGHT)),
                     style::fg("—", t::FG_DIM),
                     style::fg(&artists, t::FG),
                     style::fg(&format!("[{} {}]", shuffle, repeat), t::FG_DIM)));
-                lines.push(format!("  {}  {}  {}",
+                lines.push(format!("{}{}  {}  {}",
+                    pad,
                     style::fg(&fmt_ms(progress_ms), t::FG_DIM),
                     bar,
                     style::fg(&fmt_ms(total_ms), t::FG_DIM)));
@@ -1279,7 +1283,15 @@ fn main() {
     // would otherwise swallow them). The handle is held for the
     // lifetime of main(); dropping it on quit tears down Spirc and
     // de-registers the device from Spotify Connect.
+    //
+    // Force a token refresh before handing the access_token to
+    // librespot. Spotify's AP server is stricter about token
+    // freshness than the Web API — a token that's 5+ minutes old
+    // can be rejected with "Bad credentials" even when expires_at
+    // is still 50 minutes in the future. Refreshing right before
+    // librespot's login attempt cuts that failure mode dramatically.
     let _local_player = if cfg.local_player {
+        let _ = spotify.refresh_token();
         let access_token = spotify.get_token()
             .lock()
             .ok()
@@ -1368,9 +1380,8 @@ impl App {
         self.header.wrap = false; self.header.scroll = false;
         self.main_p = Pane::new(1, 2, cols, rows.saturating_sub(2 + NOW_H + 1),
                                 t::FG as u16, 0);
-        self.now_p  = Pane::new(COVER_W + 2, rows - NOW_H,
-                                cols.saturating_sub(COVER_W + 2),
-                                NOW_H, t::FG_BRIGHT as u16, t::BG_NOW as u16);
+        self.now_p  = Pane::new(1, rows - NOW_H, cols, NOW_H,
+                                t::FG_BRIGHT as u16, t::BG_NOW as u16);
         self.now_p.wrap = false; self.now_p.scroll = false;
         self.footer = Pane::new(1, rows, cols, 1, t::FG as u16, t::BG_BAR as u16);
         // Force re-placement of the cover after resize.
