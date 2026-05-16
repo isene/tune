@@ -1,0 +1,24 @@
+[package]
+name = "tune"
+version = "0.1.0"
+edition = "2021"
+authors = ["Geir Isene <g@isene.com>"]
+description = "Spotify Connect controller TUI. Part of the Fe2O3 Rust terminal suite."
+license = "Unlicense"
+repository = "https://github.com/isene/tune"
+
+[dependencies]
+crust    = { version = "0.1", path = "../crust", package = "fe2o3-crust" }
+# sync rspotify (ureq + rustls-with-native-certs to match kastrup/tock/amar)
+rspotify = { version = "0.16", default-features = false, features = ["client-ureq", "ureq-rustls-tls-native-certs"] }
+chrono   = "0.4"
+webbrowser = "0.8"
+serde    = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+ureq     = { version = "2", features = ["tls"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

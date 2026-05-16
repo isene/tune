@@ -1,0 +1,878 @@
+//! tune — Spotify Connect controller TUI. Part of Fe₂O₃.
+//!
+//! Architecture: rspotify (sync, ureq backend) for all API calls;
+//! crust for the panes. Single foreground thread — Spotify state
+//! polled at `config.poll_s` cadence (default 2s) from the input
+//! loop, between key events.
+
+mod auth;
+mod config;
+
+use crust::{Crust, Cursor, Input, Pane, style};
+use rspotify::{AuthCodePkceSpotify};
+use rspotify::clients::{BaseClient, OAuthClient};
+use rspotify::model::{
+    AdditionalType, Country, CurrentPlaybackContext, Device, FullTrack, Market,
+    PlayableItem, PlayContextId, RepeatState, SearchResult, SearchType,
+    SimplifiedPlaylist,
+};
+use rspotify::model::idtypes::Id;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Search,
+    Playlists,
+    PlaylistTracks,
+    Saved,
+    Queue,
+    Devices,
+    Help,
+}
+
+struct App {
+    // Spotify
+    spotify: AuthCodePkceSpotify,
+    user_display_name: String,
+
+    // Live state (refreshed via poll_state)
+    playback: Option<CurrentPlaybackContext>,
+    last_poll: std::time::Instant,
+    poll_interval: std::time::Duration,
+
+    // UI
+    header: Pane,
+    main_p: Pane,
+    now_p:  Pane,   // 4-row now-playing strip
+    footer: Pane,
+    cols:   u16,
+    rows:   u16,
+    view:   View,
+    status: Option<(String, u8)>,
+
+    // List state per view (selected row + items)
+    search_query:     String,
+    search_results:   Vec<FullTrack>,
+    search_idx:       usize,
+    playlists:        Vec<SimplifiedPlaylist>,
+    playlists_idx:    usize,
+    playlist_tracks:  Vec<FullTrack>,
+    playlist_tracks_idx: usize,
+    open_playlist:    Option<SimplifiedPlaylist>,
+    saved_tracks:     Vec<FullTrack>,
+    saved_idx:        usize,
+    queue:            Vec<FullTrack>,
+    queue_idx:        usize,
+    devices:          Vec<Device>,
+    devices_idx:      usize,
+    devices_loaded_at: Option<std::time::Instant>,
+}
+
+impl App {
+    fn new(spotify: AuthCodePkceSpotify, poll_s: u64) -> Self {
+        let (cols, rows) = Crust::terminal_size();
+        let now_h: u16 = 4;
+        let header = Pane::new(1, 1, cols, 1, t::FG_BRIGHT as u16, t::BG_BAR as u16);
+        let main_p = Pane::new(1, 2, cols, rows.saturating_sub(2 + now_h + 1),
+                               t::FG as u16, 0);
+        let now_p  = Pane::new(1, rows - now_h, cols, now_h, t::FG_BRIGHT as u16, t::BG_NOW as u16);
+        let footer = Pane::new(1, rows, cols, 1, t::FG as u16, t::BG_BAR as u16);
+        let mut header = header; header.wrap = false; header.scroll = false;
+        let mut footer = footer; footer.wrap = false; footer.scroll = false;
+        let mut now_p  = now_p;  now_p.wrap  = false; now_p.scroll  = false;
+
+        let user_display_name = spotify.current_user().ok()
+            .map(|u| u.display_name.unwrap_or_else(|| u.id.id().to_string()))
+            .unwrap_or_default();
+
+        Self {
+            spotify, user_display_name,
+            playback: None,
+            last_poll: std::time::Instant::now() - std::time::Duration::from_secs(60),
+            poll_interval: std::time::Duration::from_secs(poll_s.max(1)),
+            header, main_p, now_p, footer,
+            cols, rows,
+            view: View::Search,
+            status: None,
+            search_query: String::new(),
+            search_results: Vec::new(), search_idx: 0,
+            playlists: Vec::new(),      playlists_idx: 0,
+            playlist_tracks: Vec::new(), playlist_tracks_idx: 0,
+            open_playlist: None,
+            saved_tracks: Vec::new(),   saved_idx: 0,
+            queue: Vec::new(),          queue_idx: 0,
+            devices: Vec::new(),        devices_idx: 0,
+            devices_loaded_at: None,
+        }
+    }
+
+    fn render_all(&mut self) {
+        self.render_header();
+        self.render_main();
+        self.render_now();
+        self.render_footer();
+        // Park the terminal cursor in an invisible corner — no field
+        // needs a visible caret on this screen.
+        Cursor::hide();
+    }
+
+    fn render_header(&mut self) {
+        let dev = self.playback.as_ref()
+            .map(|p| p.device.name.as_str()).unwrap_or("—");
+        let view_lbl = match self.view {
+            View::Search          => "Search",
+            View::Playlists       => "Playlists",
+            View::PlaylistTracks  => self.open_playlist.as_ref()
+                .map(|p| p.name.as_str()).unwrap_or("Playlist"),
+            View::Saved           => "Saved",
+            View::Queue           => "Queue",
+            View::Devices         => "Devices",
+            View::Help            => "Help",
+        };
+        let left = format!(" tune  [{}]", style::bold(&style::fg(view_lbl, t::ACCENT)));
+        let right = format!("{}  {}  v{} ",
+            style::fg(&self.user_display_name, t::FG_MUTED),
+            style::fg(&format!("◆ {}", dev), t::CYAN),
+            VERSION);
+        let pad_w = (self.cols as usize)
+            .saturating_sub(crust::display_width(&left) + crust::display_width(&right));
+        self.header.set_text(&format!("{}{}{}", left, " ".repeat(pad_w), right));
+        self.header.full_refresh();
+    }
+
+    fn render_main(&mut self) {
+        let mut lines: Vec<String> = Vec::new();
+        match self.view {
+            View::Search          => self.lines_search(&mut lines),
+            View::Playlists       => self.lines_playlists(&mut lines),
+            View::PlaylistTracks  => self.lines_playlist_tracks(&mut lines),
+            View::Saved           => self.lines_saved(&mut lines),
+            View::Queue           => self.lines_queue(&mut lines),
+            View::Devices         => self.lines_devices(&mut lines),
+            View::Help            => self.lines_help(&mut lines),
+        }
+        self.main_p.set_text(&lines.join("\n"));
+        self.main_p.full_refresh();
+    }
+
+    fn render_now(&mut self) {
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(String::new());
+        match &self.playback {
+            None => {
+                lines.push(format!("  {}", style::fg("Nothing playing.", t::FG_DIM)));
+                lines.push(format!("  {}",
+                    style::fg("Press SPACE to resume on your last device, or `d` to pick one.",
+                              t::FG_DIM)));
+            }
+            Some(pb) => {
+                let (title, artists) = match &pb.item {
+                    Some(PlayableItem::Track(t)) => (
+                        t.name.clone(),
+                        t.artists.iter().map(|a| a.name.as_str())
+                            .collect::<Vec<_>>().join(", "),
+                    ),
+                    Some(PlayableItem::Episode(e)) => (
+                        e.name.clone(),
+                        e.show.name.clone(),
+                    ),
+                    _ => ("—".to_string(), "—".to_string()),
+                };
+                let playing = pb.is_playing;
+                let symbol = if playing { "▶" } else { "⏸" };
+                let symcol = if playing { t::OK } else { t::AMBER };
+                let progress_ms = pb.progress.map(|d| d.num_milliseconds() as u64).unwrap_or(0);
+                let total_ms = match &pb.item {
+                    Some(PlayableItem::Track(t))   => t.duration.num_milliseconds() as u64,
+                    Some(PlayableItem::Episode(e)) => e.duration.num_milliseconds() as u64,
+                    _ => 0,
+                };
+                let bar = progress_bar(progress_ms, total_ms,
+                    (self.cols as usize).saturating_sub(20));
+                let shuffle = if pb.shuffle_state { "🔀" } else { "  " };
+                let repeat = match pb.repeat_state {
+                    RepeatState::Off => "  ",
+                    RepeatState::Context => "🔁",
+                    RepeatState::Track => "🔂",
+                };
+                lines.push(format!("  {} {}  {}  {}  {}",
+                    style::fg(symbol, symcol),
+                    style::bold(&style::fg(&title, t::FG_BRIGHT)),
+                    style::fg("—", t::FG_DIM),
+                    style::fg(&artists, t::FG),
+                    style::fg(&format!("[{} {}]", shuffle, repeat), t::FG_DIM)));
+                lines.push(format!("  {}  {}  {}",
+                    style::fg(&fmt_ms(progress_ms), t::FG_DIM),
+                    bar,
+                    style::fg(&fmt_ms(total_ms), t::FG_DIM)));
+            }
+        }
+        self.now_p.set_text(&lines.join("\n"));
+        self.now_p.border_refresh();
+        self.now_p.full_refresh();
+    }
+
+    fn render_footer(&mut self) {
+        let (msg, col) = match &self.status {
+            Some((m, c)) => (m.clone(), *c),
+            None => (
+                " /:search  P:playlists  L:saved  Q:queue  d:devices  ?:help  q:quit ".to_string(),
+                t::FG_MUTED,
+            ),
+        };
+        self.footer.set_text(&style::fg(&msg, col));
+        self.footer.full_refresh();
+    }
+
+    fn set_status(&mut self, msg: &str, color: u8) {
+        self.status = Some((format!(" {}", msg), color));
+        self.render_footer();
+    }
+    fn clear_status(&mut self) {
+        self.status = None;
+        self.render_footer();
+    }
+
+    // ---- Polling ----------------------------------------------------
+
+    fn poll_state(&mut self) {
+        if self.last_poll.elapsed() < self.poll_interval { return; }
+        self.last_poll = std::time::Instant::now();
+        let additional = &[AdditionalType::Track, AdditionalType::Episode];
+        match self.spotify.current_playback(None, Some(additional)) {
+            Ok(pb) => { self.playback = pb; self.render_header(); self.render_now(); }
+            Err(_) => { /* transient — keep last known state */ }
+        }
+    }
+
+    // ---- View loaders -----------------------------------------------
+
+    fn ensure_playlists_loaded(&mut self) {
+        if !self.playlists.is_empty() { return; }
+        let mut out = Vec::new();
+        let mut iter = self.spotify.current_user_playlists();
+        while let Some(item) = iter.next() {
+            match item {
+                Ok(pl) => out.push(pl),
+                Err(_) => break,
+            }
+            if out.len() >= 200 { break; }
+        }
+        self.playlists = out;
+    }
+
+    fn ensure_saved_loaded(&mut self) {
+        if !self.saved_tracks.is_empty() { return; }
+        let mut out = Vec::new();
+        let mut iter = self.spotify.current_user_saved_tracks(None);
+        while let Some(item) = iter.next() {
+            match item {
+                Ok(st) => out.push(st.track),
+                Err(_) => break,
+            }
+            if out.len() >= 200 { break; }
+        }
+        self.saved_tracks = out;
+    }
+
+    fn ensure_queue_loaded(&mut self) {
+        match self.spotify.current_user_queue() {
+            Ok(q) => self.queue = q.queue.into_iter().filter_map(|pi| match pi {
+                PlayableItem::Track(t) => Some(t),
+                _ => None,
+            }).collect(),
+            Err(_) => {}
+        }
+    }
+
+    fn load_devices(&mut self) {
+        self.devices = self.spotify.device().unwrap_or_default();
+        self.devices_loaded_at = Some(std::time::Instant::now());
+    }
+
+    fn load_playlist_tracks(&mut self, pl: SimplifiedPlaylist) {
+        let mut out = Vec::new();
+        let mut iter = self.spotify.playlist_items(pl.id.clone_static(), None, None);
+        while let Some(item) = iter.next() {
+            match item {
+                Ok(pi) => {
+                    if let Some(PlayableItem::Track(t)) = pi.item {
+                        out.push(t);
+                    }
+                }
+                Err(_) => break,
+            }
+            if out.len() >= 500 { break; }
+        }
+        self.playlist_tracks = out;
+        self.playlist_tracks_idx = 0;
+        self.open_playlist = Some(pl);
+    }
+
+    // ---- Rendering per view -----------------------------------------
+
+    fn lines_search(&self, out: &mut Vec<String>) {
+        out.push(String::new());
+        out.push(format!("  {}  {}",
+            style::fg("/", t::ACCENT),
+            if self.search_query.is_empty() {
+                style::fg("Press / to search…", t::FG_DIM).to_string()
+            } else {
+                format!("{}  {}",
+                    style::fg("query:", t::FG_DIM),
+                    style::fg(&self.search_query, t::FG))
+            }));
+        out.push(String::new());
+        for (i, t) in self.search_results.iter().enumerate() {
+            out.push(track_row(t, i == self.search_idx));
+        }
+        if self.search_results.is_empty() && !self.search_query.is_empty() {
+            out.push(format!("  {}", style::fg("(no results)", t::FG_DIM)));
+        }
+    }
+
+    fn lines_playlists(&self, out: &mut Vec<String>) {
+        out.push(String::new());
+        out.push(format!("  {}",
+            style::bold(&style::fg("Your playlists", t::ACCENT))));
+        out.push(String::new());
+        if self.playlists.is_empty() {
+            out.push(format!("  {}", style::fg("Loading…", t::FG_DIM)));
+            return;
+        }
+        for (i, pl) in self.playlists.iter().enumerate() {
+            let cursor = if i == self.playlists_idx { "▸" } else { " " };
+            let count = pl.items.total;
+            let line = format!("  {}  {:<40}  {}",
+                cursor,
+                truncate(&pl.name, 40),
+                style::fg(&format!("{} tracks", count), t::FG_DIM));
+            out.push(if i == self.playlists_idx {
+                style::bold(&style::fg(&line, t::FG_BRIGHT)).to_string()
+            } else { line });
+        }
+    }
+
+    fn lines_playlist_tracks(&self, out: &mut Vec<String>) {
+        out.push(String::new());
+        let title = self.open_playlist.as_ref().map(|p| p.name.as_str())
+            .unwrap_or("Playlist");
+        out.push(format!("  {}",
+            style::bold(&style::fg(title, t::ACCENT))));
+        out.push(String::new());
+        if self.playlist_tracks.is_empty() {
+            out.push(format!("  {}", style::fg("Loading…", t::FG_DIM)));
+            return;
+        }
+        for (i, t) in self.playlist_tracks.iter().enumerate() {
+            out.push(track_row(t, i == self.playlist_tracks_idx));
+        }
+    }
+
+    fn lines_saved(&self, out: &mut Vec<String>) {
+        out.push(String::new());
+        out.push(format!("  {}",
+            style::bold(&style::fg("Your liked songs", t::ACCENT))));
+        out.push(String::new());
+        if self.saved_tracks.is_empty() {
+            out.push(format!("  {}", style::fg("Loading…", t::FG_DIM)));
+            return;
+        }
+        for (i, t) in self.saved_tracks.iter().enumerate() {
+            out.push(track_row(t, i == self.saved_idx));
+        }
+    }
+
+    fn lines_queue(&self, out: &mut Vec<String>) {
+        out.push(String::new());
+        out.push(format!("  {}",
+            style::bold(&style::fg("Up next", t::ACCENT))));
+        out.push(String::new());
+        if self.queue.is_empty() {
+            out.push(format!("  {}",
+                style::fg("(queue empty — Spotify shows context-driven autoplay here)",
+                    t::FG_DIM)));
+            return;
+        }
+        for (i, t) in self.queue.iter().enumerate() {
+            out.push(track_row(t, i == self.queue_idx));
+        }
+    }
+
+    fn lines_devices(&self, out: &mut Vec<String>) {
+        out.push(String::new());
+        out.push(format!("  {}",
+            style::bold(&style::fg("Spotify Connect devices", t::ACCENT))));
+        out.push(String::new());
+        if self.devices.is_empty() {
+            out.push(format!("  {}",
+                style::fg("No devices available (open Spotify on your phone or desktop first).",
+                    t::FG_DIM)));
+            return;
+        }
+        for (i, dev) in self.devices.iter().enumerate() {
+            let active = dev.is_active;
+            let cursor = if i == self.devices_idx { "▸" } else { " " };
+            let marker = if active { "●" } else { "○" };
+            let kind: &'static str = (&dev._type).into();
+            let vol = dev.volume_percent.map(|v| format!("{}%", v))
+                .unwrap_or_else(|| "—".to_string());
+            let line = format!("  {}  {} {:<24}  {:<10}  vol {}",
+                cursor, marker,
+                truncate(&dev.name, 24),
+                kind, vol);
+            out.push(if i == self.devices_idx {
+                style::bold(&style::fg(&line, t::FG_BRIGHT)).to_string()
+            } else if active {
+                style::fg(&line, t::OK).to_string()
+            } else { line });
+        }
+    }
+
+    fn lines_help(&self, out: &mut Vec<String>) {
+        let k = |s: &str| style::fg(s, t::ACCENT);
+        let h = |s: &str| style::bold(&style::fg(s, t::CYAN));
+        out.push(String::new());
+        out.push(format!("  {}", style::bold(&style::fg(
+            "tune — keys", t::ACCENT))));
+        out.push(String::new());
+        out.push(format!("  {}", h("Views")));
+        for (key, desc) in [
+            ("/", "Search"),
+            ("P", "Playlists"),
+            ("L", "Liked / saved tracks"),
+            ("Q", "Up-next queue"),
+            ("d", "Devices (Spotify Connect)"),
+            ("?", "This help"),
+        ] {
+            out.push(format!("    {:<8} {}", k(key), desc));
+        }
+        out.push(String::new());
+        out.push(format!("  {}", h("Playback")));
+        for (key, desc) in [
+            ("SPACE",  "Play / pause"),
+            ("n",      "Next track"),
+            ("b",      "Previous track"),
+            ("+ / -",  "Volume up / down (5%)"),
+            ("[ / ]",  "Seek -5s / +5s"),
+            ("s",      "Toggle shuffle"),
+            ("r",      "Cycle repeat mode (off / context / track)"),
+        ] {
+            out.push(format!("    {:<8} {}", k(key), desc));
+        }
+        out.push(String::new());
+        out.push(format!("  {}", h("Lists")));
+        for (key, desc) in [
+            ("j / k",  "Down / up"),
+            ("g / G",  "Top / bottom"),
+            ("ENTER",  "Play this item / open playlist"),
+            ("a",      "Add this track to the queue"),
+            ("h",      "Back to playlist list"),
+        ] {
+            out.push(format!("    {:<8} {}", k(key), desc));
+        }
+        out.push(String::new());
+        out.push(format!("  {}", h("Misc")));
+        for (key, desc) in [
+            ("R",      "Refresh now-playing"),
+            ("q",      "Quit"),
+        ] {
+            out.push(format!("    {:<8} {}", k(key), desc));
+        }
+    }
+
+    // ---- Key dispatch -----------------------------------------------
+
+    fn handle(&mut self, key: &str) -> bool {
+        self.clear_status();
+        // Help view: q backs out instead of quitting (otherwise `?`
+        // → `q` flow would quit the app, which surprises everyone).
+        if (key == "q" || key == "Q") && self.view == View::Help {
+            self.view = View::Search;
+            self.render_header();
+            self.render_main();
+            return false;
+        }
+        if key == "q" { return true; }
+        let was = self.view;
+        match key {
+            // ---- view switching ----
+            "?"  => { self.view = View::Help; }
+            "/"  => { self.view = View::Search; self.search_prompt(); }
+            "P"  => { self.view = View::Playlists; self.ensure_playlists_loaded(); }
+            "L"  => { self.view = View::Saved; self.ensure_saved_loaded(); }
+            "Q"  => { self.view = View::Queue; self.ensure_queue_loaded(); }
+            "d"  => { self.view = View::Devices; self.load_devices(); }
+            "h" if self.view == View::PlaylistTracks => {
+                self.view = View::Playlists;
+            }
+            // ---- list navigation ----
+            "j" | "DOWN" => self.list_down(),
+            "k" | "UP"   => self.list_up(),
+            "g" | "HOME" => self.list_top(),
+            "G" | "END"  => self.list_bottom(),
+            "PgDOWN"     => for _ in 0..10 { self.list_down(); },
+            "PgUP"       => for _ in 0..10 { self.list_up(); },
+            "ENTER"      => self.list_activate(),
+            "a"          => self.queue_current(),
+            // ---- playback ----
+            " " | "SPACE" => self.toggle_play(),
+            "n"           => self.skip_next(),
+            "b"           => self.skip_prev(),
+            "+"           => self.bump_volume( 5),
+            "-"           => self.bump_volume(-5),
+            "]"           => self.seek_relative( 5_000),
+            "["           => self.seek_relative(-5_000),
+            "s"           => self.toggle_shuffle(),
+            "r"           => self.cycle_repeat(),
+            "R"           => { self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
+                              self.poll_state(); }
+            _ => {}
+        }
+        if self.view != was {
+            self.render_header();
+        }
+        self.render_main();
+        false
+    }
+
+    fn search_prompt(&mut self) {
+        Cursor::show();
+        let q = self.footer.ask(" search: ", &self.search_query);
+        Cursor::hide();
+        let q = q.trim().to_string();
+        if q.is_empty() { return; }
+        self.search_query = q.clone();
+        match self.spotify.search(&q, SearchType::Track, Some(Market::Country(Country::Norway)),
+                                  None, Some(30), None) {
+            Ok(SearchResult::Tracks(p)) => {
+                self.search_results = p.items;
+                self.search_idx = 0;
+            }
+            Ok(_) => self.set_status("Unexpected response shape", t::ERR),
+            Err(e) => self.set_status(&format!("Search failed: {}", e), t::ERR),
+        }
+        self.render_footer();
+    }
+
+    fn list_down(&mut self) {
+        let (idx, len) = self.current_list_indices();
+        if let Some(len) = len { if idx + 1 < len { self.set_list_idx(idx + 1); } }
+    }
+    fn list_up(&mut self) {
+        let (idx, _) = self.current_list_indices();
+        if idx > 0 { self.set_list_idx(idx - 1); }
+    }
+    fn list_top(&mut self) { self.set_list_idx(0); }
+    fn list_bottom(&mut self) {
+        if let Some(len) = self.current_list_indices().1 {
+            if len > 0 { self.set_list_idx(len - 1); }
+        }
+    }
+    fn current_list_indices(&self) -> (usize, Option<usize>) {
+        match self.view {
+            View::Search          => (self.search_idx,          Some(self.search_results.len())),
+            View::Playlists       => (self.playlists_idx,       Some(self.playlists.len())),
+            View::PlaylistTracks  => (self.playlist_tracks_idx, Some(self.playlist_tracks.len())),
+            View::Saved           => (self.saved_idx,           Some(self.saved_tracks.len())),
+            View::Queue           => (self.queue_idx,           Some(self.queue.len())),
+            View::Devices         => (self.devices_idx,         Some(self.devices.len())),
+            View::Help            => (0, None),
+        }
+    }
+    fn set_list_idx(&mut self, i: usize) {
+        match self.view {
+            View::Search          => self.search_idx = i,
+            View::Playlists       => self.playlists_idx = i,
+            View::PlaylistTracks  => self.playlist_tracks_idx = i,
+            View::Saved           => self.saved_idx = i,
+            View::Queue           => self.queue_idx = i,
+            View::Devices         => self.devices_idx = i,
+            View::Help            => {}
+        }
+    }
+
+    fn current_track_uri(&self) -> Option<rspotify::model::TrackId<'static>> {
+        let t = match self.view {
+            View::Search         => self.search_results.get(self.search_idx),
+            View::PlaylistTracks => self.playlist_tracks.get(self.playlist_tracks_idx),
+            View::Saved          => self.saved_tracks.get(self.saved_idx),
+            View::Queue          => self.queue.get(self.queue_idx),
+            _ => None,
+        }?;
+        t.id.clone().map(|id| id.clone_static())
+    }
+
+    fn list_activate(&mut self) {
+        match self.view {
+            View::Playlists => {
+                if let Some(pl) = self.playlists.get(self.playlists_idx).cloned() {
+                    self.view = View::PlaylistTracks;
+                    self.load_playlist_tracks(pl);
+                }
+            }
+            View::PlaylistTracks => {
+                // Play from this offset within the playlist context.
+                // rspotify's Offset::Position is a chrono::Duration whose
+                // `num_milliseconds()` is read as the integer track index
+                // (a Spotify API quirk), so `Duration::milliseconds(idx)`
+                // is exactly what we want.
+                let pl  = self.open_playlist.clone();
+                let idx = self.playlist_tracks_idx;
+                if let Some(pl) = pl {
+                    let ctx = PlayContextId::Playlist(pl.id.clone_static());
+                    let offset = Some(rspotify::model::Offset::Position(
+                        chrono::Duration::milliseconds(idx as i64)));
+                    match self.spotify.start_context_playback(ctx, None, offset, None) {
+                        Ok(_)  => self.set_status(
+                            &format!("Playing from #{}", idx + 1), t::OK),
+                        Err(e) => self.set_status(
+                            &format!("Play failed: {}", e), t::ERR),
+                    }
+                }
+            }
+            View::Devices => {
+                if let Some(dev) = self.devices.get(self.devices_idx).cloned() {
+                    if let Some(id) = dev.id {
+                        match self.spotify.transfer_playback(&id, Some(true)) {
+                            Ok(_)  => self.set_status(
+                                &format!("Transferred to {}", dev.name), t::OK),
+                            Err(e) => self.set_status(
+                                &format!("Transfer failed: {}", e), t::ERR),
+                        }
+                    }
+                }
+            }
+            View::Search | View::Saved | View::Queue => {
+                if let Some(id) = self.current_track_uri() {
+                    let uri = rspotify::model::PlayableId::Track(id);
+                    match self.spotify.start_uris_playback(
+                        std::iter::once(uri), None, None, None) {
+                        Ok(_)  => self.set_status("Playing", t::OK),
+                        Err(e) => self.set_status(&format!("Play failed: {}", e), t::ERR),
+                    }
+                }
+            }
+            View::Help => {}
+        }
+        self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
+        self.poll_state();
+    }
+
+    fn queue_current(&mut self) {
+        let Some(id) = self.current_track_uri() else { return };
+        let uri = rspotify::model::PlayableId::Track(id);
+        match self.spotify.add_item_to_queue(uri, None) {
+            Ok(_)  => self.set_status("Added to queue", t::OK),
+            Err(e) => self.set_status(&format!("Queue failed: {}", e), t::ERR),
+        }
+    }
+
+    fn toggle_play(&mut self) {
+        let playing = self.playback.as_ref().map(|p| p.is_playing).unwrap_or(false);
+        let r = if playing {
+            self.spotify.pause_playback(None)
+        } else {
+            self.spotify.resume_playback(None, None)
+        };
+        match r {
+            Ok(_)  => {}
+            Err(e) => self.set_status(&format!("Toggle failed: {}", e), t::ERR),
+        }
+        self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
+        self.poll_state();
+    }
+
+    fn skip_next(&mut self) {
+        let _ = self.spotify.next_track(None);
+        self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
+        self.poll_state();
+    }
+    fn skip_prev(&mut self) {
+        let _ = self.spotify.previous_track(None);
+        self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
+        self.poll_state();
+    }
+
+    fn bump_volume(&mut self, delta: i32) {
+        let cur = self.playback.as_ref()
+            .and_then(|p| p.device.volume_percent.map(|v| v as i32))
+            .unwrap_or(50);
+        let new = (cur + delta).clamp(0, 100) as u8;
+        let _ = self.spotify.volume(new, None);
+        self.set_status(&format!("Volume: {}%", new), t::OK);
+        // Reflect immediately
+        if let Some(ref mut pb) = self.playback {
+            pb.device.volume_percent = Some(new as u32);
+        }
+        self.render_now();
+    }
+
+    fn seek_relative(&mut self, delta_ms: i64) {
+        let cur = self.playback.as_ref()
+            .and_then(|p| p.progress.map(|d| d.num_milliseconds()))
+            .unwrap_or(0);
+        let total = match self.playback.as_ref().and_then(|p| p.item.as_ref()) {
+            Some(PlayableItem::Track(t))   => t.duration.num_milliseconds(),
+            Some(PlayableItem::Episode(e)) => e.duration.num_milliseconds(),
+            _ => 0,
+        };
+        let target = (cur + delta_ms).clamp(0, total.max(0));
+        let _ = self.spotify.seek_track(chrono::Duration::milliseconds(target), None);
+        self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
+        self.poll_state();
+    }
+
+    fn toggle_shuffle(&mut self) {
+        let cur = self.playback.as_ref().map(|p| p.shuffle_state).unwrap_or(false);
+        let _ = self.spotify.shuffle(!cur, None);
+        self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
+        self.poll_state();
+    }
+
+    fn cycle_repeat(&mut self) {
+        let next = match self.playback.as_ref().map(|p| p.repeat_state).unwrap_or(RepeatState::Off) {
+            RepeatState::Off     => RepeatState::Context,
+            RepeatState::Context => RepeatState::Track,
+            RepeatState::Track   => RepeatState::Off,
+        };
+        let _ = self.spotify.repeat(next, None);
+        self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
+        self.poll_state();
+    }
+}
+
+// ---- Helpers --------------------------------------------------------
+
+fn track_row(t: &FullTrack, selected: bool) -> String {
+    let cursor = if selected { "▸" } else { " " };
+    let artists = t.artists.iter().map(|a| a.name.as_str())
+        .collect::<Vec<_>>().join(", ");
+    let line = format!("  {}  {:<40}  {:<28}  {}",
+        cursor,
+        truncate(&t.name, 40),
+        truncate(&artists, 28),
+        style::fg(&fmt_ms(t.duration.num_milliseconds() as u64), t::FG_DIM));
+    if selected {
+        style::bold(&style::fg(&line, t::FG_BRIGHT)).to_string()
+    } else { line }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if crust::display_width(s) <= max { return s.to_string(); }
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = crust::display_width(&c.to_string());
+        if w + cw > max.saturating_sub(1) { break; }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+fn fmt_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let m = secs / 60;
+    let s = secs % 60;
+    format!("{}:{:02}", m, s)
+}
+
+fn progress_bar(cur_ms: u64, total_ms: u64, width: usize) -> String {
+    if total_ms == 0 || width < 4 { return "—".repeat(width); }
+    let ratio = (cur_ms as f64 / total_ms as f64).clamp(0.0, 1.0);
+    let filled = (ratio * width as f64).round() as usize;
+    let unfilled = width.saturating_sub(filled);
+    format!("{}{}",
+        style::fg(&"━".repeat(filled),   t::ACCENT),
+        style::fg(&"─".repeat(unfilled), t::FG_DIM))
+}
+
+// ---- Theme ---------------------------------------------------------
+
+mod t {
+    pub const FG:         u8 = 252;
+    pub const FG_BRIGHT:  u8 = 255;
+    pub const FG_MUTED:   u8 = 245;
+    pub const FG_DIM:     u8 = 240;
+    pub const BG_BAR:     u8 = 235;
+    pub const BG_NOW:     u8 = 234;
+    pub const ACCENT:     u8 = 28;   // Spotify-ish green
+    pub const CYAN:       u8 = 51;
+    pub const AMBER:      u8 = 220;
+    pub const OK:         u8 = 156;
+    pub const ERR:        u8 = 196;
+}
+
+// ---- Main ---------------------------------------------------------
+
+fn main() {
+    let mut cfg = config::load();
+    if cfg.client_id.trim().is_empty() {
+        config::print_setup_instructions();
+        let mut buf = String::new();
+        if std::io::stdin().read_line(&mut buf).is_err() {
+            eprintln!("aborted");
+            std::process::exit(1);
+        }
+        let id = buf.trim().to_string();
+        if id.is_empty() {
+            eprintln!("No client ID — aborting.");
+            std::process::exit(1);
+        }
+        cfg.client_id = id;
+        if let Err(e) = config::save(&cfg) {
+            eprintln!("Could not save config: {}", e);
+            std::process::exit(1);
+        }
+        eprintln!("Saved to ~/.tune/config.yml.\n");
+    }
+
+    let mut spotify = auth::build_client(&cfg.client_id);
+    // Try cached token first; only run the browser flow if there is none.
+    let cached = spotify.read_token_cache(true).ok().flatten();
+    if let Some(tok) = cached {
+        *spotify.get_token().lock().unwrap() = Some(tok);
+    } else if let Err(e) = auth::authorize(&mut spotify) {
+        eprintln!("Authorization failed: {}", e);
+        std::process::exit(1);
+    }
+
+    Crust::init();
+    Crust::set_app_identity("Tune");
+    Crust::clear_screen();
+    let mut app = App::new(spotify, cfg.poll_s);
+    app.poll_state();
+    app.render_all();
+
+    loop {
+        if let Some(key) = Input::getchr(Some(500)) {
+            if app.handle(&key) { break; }
+        }
+        app.poll_state();
+        if app.handle_resize_if_needed() { app.render_all(); }
+    }
+    Cursor::show();
+    Crust::cleanup();
+}
+
+impl App {
+    fn handle_resize_if_needed(&mut self) -> bool {
+        let (cols, rows) = Crust::terminal_size();
+        if cols == self.cols && rows == self.rows { return false; }
+        self.cols = cols; self.rows = rows;
+        let now_h: u16 = 4;
+        self.header = Pane::new(1, 1, cols, 1, t::FG_BRIGHT as u16, t::BG_BAR as u16);
+        self.header.wrap = false; self.header.scroll = false;
+        self.main_p = Pane::new(1, 2, cols, rows.saturating_sub(2 + now_h + 1),
+                                t::FG as u16, 0);
+        self.now_p  = Pane::new(1, rows - now_h, cols, now_h, t::FG_BRIGHT as u16, t::BG_NOW as u16);
+        self.now_p.wrap = false; self.now_p.scroll = false;
+        self.footer = Pane::new(1, rows, cols, 1, t::FG as u16, t::BG_BAR as u16);
+        self.footer.wrap = false; self.footer.scroll = false;
+        Crust::clear_screen();
+        true
+    }
+}
