@@ -18,9 +18,12 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: tune-linux-x86_64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: tune-linux-aarch64
+          # aarch64-linux cross-compile dropped: alsa-sys + libpulse-sys
+          # both need their dev headers in the cross sysroot, and the
+          # default GH runner doesn't carry libasound2-dev:arm64 /
+          # libpulse-dev:arm64. Raspberry Pi / aarch64 users can
+          # `cargo build --release` locally — the native build works
+          # fine, just CI cross-compile doesn't.
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: tune-macos-x86_64
@@ -44,12 +47,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install libpulse-dev (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          sudo apt-get install -y libpulse-dev
 
       - name: Build
         working-directory: tune
@@ -100,6 +102,10 @@ jobs:
 
             ## Platforms
             - `tune-linux-x86_64` - Linux (Intel/AMD 64-bit)
-            - `tune-linux-aarch64` - Linux (ARM 64-bit, Raspberry Pi)
             - `tune-macos-x86_64` - macOS (Intel)
             - `tune-macos-aarch64` - macOS (Apple Silicon)
+
+            ## aarch64-linux (Raspberry Pi etc.)
+            Not provided as a prebuilt because libpulse-dev / libasound2-dev
+            need the arm64 sysroot which the GH runners don't carry. Native
+            `cargo build --release` works fine on aarch64 hardware.
