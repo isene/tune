@@ -97,8 +97,18 @@ fn run(access_token: String, device_name: String, shutdown_rx: oneshot::Receiver
         // controllers send their own volume commands and the OS
         // mixer is the canonical control plane; layering an
         // internal mixer here would double up the curve.
-        let Some(backend) = audio_backend::find(Some("pulseaudio".into())) else {
-            eprintln!("librespot: pulseaudio backend not found");
+        // Audio backend: Cargo.toml chooses the feature per target,
+        // and we pass the matching name here. On Linux we prefer
+        // `pulseaudio` (libpulse → PipeWire-pulse on modern systems —
+        // sink auto-suspends when idle, lowest battery drain).
+        // Everywhere else falls back to `rodio` (CoreAudio on macOS,
+        // cpal-driven elsewhere) so the binary cross-compiles.
+        #[cfg(target_os = "linux")]
+        const BACKEND_NAME: &str = "pulseaudio";
+        #[cfg(not(target_os = "linux"))]
+        const BACKEND_NAME: &str = "rodio";
+        let Some(backend) = audio_backend::find(Some(BACKEND_NAME.into())) else {
+            eprintln!("librespot: {} backend not found", BACKEND_NAME);
             return;
         };
         let player_config = PlayerConfig::default();
