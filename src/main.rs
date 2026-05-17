@@ -105,13 +105,14 @@ struct App {
     cover_w: u16,
 }
 
-/// Height of the now-playing strip in rows. The cover art fills
-/// this strip height-to-edge; its width-in-cells is computed
-/// dynamically from the terminal's actual cell aspect ratio
-/// (see `cover_cell_width_for_height` below) so a square Spotify
-/// cover ends up as a square pixel image that uses every pixel
-/// row of the strip — no wasted vertical space.
-const NOW_H: u16 = 14;
+/// Height of the now-playing strip in rows. Sized so the strip is
+/// unobtrusive (5 rows is roughly the height of a status bar plus a
+/// progress line); the album cover then fills this height edge-to-
+/// edge, with its cell-width derived from the terminal's actual
+/// cell aspect ratio (see `cover_cell_width_for_height` below).
+/// Same pattern as pointer / watchit / astro: image fills the pane
+/// height; width follows from aspect.
+const NOW_H: u16 = 5;
 /// Left padding before the cover. Starting at col 2 leaves a one-
 /// cell gutter against the terminal edge instead of butting the
 /// art straight up against the frame.
@@ -428,6 +429,41 @@ impl App {
         if placed { self.cover_track_id = Some(track_id); }
     }
 
+    /// Open the highest-resolution cover for the current track in the
+    /// user's image viewer. Routed through `xdg-open` so the user's
+    /// xdg-mime default for `image/jpeg` picks the program (feh, sxiv,
+    /// eog, etc.) — no hardcoded viewer name.
+    fn show_cover_external(&mut self) {
+        let (track_id, url) = match self.playback.as_ref()
+            .and_then(|pb| pb.item.as_ref())
+        {
+            Some(item) => match cover_id_and_full_url(item) {
+                Some(pair) => pair,
+                None => { self.set_status(
+                    "No cover available for this track", t::ERR); return; }
+            },
+            None => { self.set_status("Nothing playing", t::ERR); return; }
+        };
+        let path = cover_full_cache_path(&track_id);
+        if !path.exists() {
+            if let Err(e) = download_cover(&url, &path) {
+                self.set_status(
+                    &format!("Cover download failed: {}", e), t::ERR);
+                return;
+            }
+        }
+        match std::process::Command::new("xdg-open")
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_)  => self.set_status("Opening cover…", t::OK),
+            Err(e) => self.set_status(
+                &format!("xdg-open failed: {}", e), t::ERR),
+        }
+    }
+
     fn clear_cover(&mut self) {
         if self.cover_track_id.is_none() { return; }
         let (_, rows) = Crust::terminal_size();
@@ -707,6 +743,7 @@ impl App {
         out.push(String::new());
         out.push(format!("  {}", h("Misc")));
         for (key, desc) in [
+            ("v",      "View full album cover in your image viewer"),
             ("R",      "Refresh now-playing"),
             ("q",      "Quit"),
         ] {
@@ -765,6 +802,7 @@ impl App {
             "r"           => self.cycle_repeat(),
             "R"           => { self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
                               self.poll_state(); }
+            "v"           => self.show_cover_external(),
             _ => {}
         }
         if self.view != was {
@@ -1144,6 +1182,47 @@ fn cover_id_and_url(item: &PlayableItem) -> Option<(String, String)> {
 fn cover_cache_path(track_id: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let dir = PathBuf::from(home).join(".tune").join("cover_cache");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("{}.jpg", track_id))
+}
+
+/// Like `cover_id_and_url` but picks the *largest* image for the
+/// "view in external viewer" flow, where pixel count matters and the
+/// download is one-shot per track (cached on disk afterwards).
+fn cover_id_and_full_url(item: &PlayableItem) -> Option<(String, String)> {
+    match item {
+        PlayableItem::Track(t) => {
+            let id = t.id.as_ref()?.id().to_string();
+            let url = t.album.images.iter()
+                .max_by_key(|i| i.width.unwrap_or(0))
+                .map(|i| i.url.clone())?;
+            Some((id, url))
+        }
+        PlayableItem::Episode(e) => {
+            let id = e.id.id().to_string();
+            let url = e.images.iter()
+                .max_by_key(|i| i.width.unwrap_or(0))
+                .map(|i| i.url.clone())?;
+            Some((id, url))
+        }
+        PlayableItem::Unknown(j) => {
+            let id = j.get("id").and_then(|v| v.as_str())?.to_string();
+            let images = j.get("album").and_then(|a| a.get("images"))
+                .or_else(|| j.get("images"))
+                .and_then(|v| v.as_array())?;
+            let url = images.iter()
+                .max_by_key(|i| i.get("width")
+                    .and_then(|w| w.as_u64()).unwrap_or(0))
+                .and_then(|i| i.get("url").and_then(|u| u.as_str()))
+                .map(String::from)?;
+            Some((id, url))
+        }
+    }
+}
+
+fn cover_full_cache_path(track_id: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = PathBuf::from(home).join(".tune").join("cover_cache").join("full");
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("{}.jpg", track_id))
 }
