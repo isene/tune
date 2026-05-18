@@ -113,10 +113,9 @@ struct App {
 /// Same pattern as pointer / watchit / astro: image fills the pane
 /// height; width follows from aspect.
 const NOW_H: u16 = 5;
-/// Left padding before the cover. Starting at col 2 leaves a one-
-/// cell gutter against the terminal edge instead of butting the
-/// art straight up against the frame.
-const COVER_X: u16 = 2;
+/// Left padding before the cover. Col 1 means the artwork runs
+/// edge-to-edge against the terminal frame — no gutter, no border.
+const COVER_X: u16 = 1;
 
 /// Compute the cover thumbnail's width in cells so that a square
 /// image scaled to `NOW_H` rows of pixel height comes out exactly
@@ -294,12 +293,12 @@ impl App {
 
     fn render_now(&mut self) {
         // Indent each line past the cover thumbnail: COVER_X cells
-        // of left gutter, cover_w cells of cover, and one more cell
-        // of gap before the text. The pane spans full width so its
-        // bg fills edge-to-edge; the kitty cover image is placed
-        // at z=1 and overlays the leftmost cells without clobbering
-        // the bg color underneath.
-        let pad = " ".repeat((COVER_X + self.cover_w + 1) as usize);
+        // of left margin (now 1 — no border) plus cover_w cells of
+        // cover. Text starts immediately at the cover's right edge.
+        // The pane spans full width so its bg fills edge-to-edge;
+        // the kitty cover image is placed at z=1 and overlays the
+        // leftmost cells without clobbering the bg color underneath.
+        let pad = " ".repeat((COVER_X + self.cover_w) as usize);
         let mut lines: Vec<String> = Vec::new();
         lines.push(String::new());
         match &self.playback {
@@ -351,7 +350,7 @@ impl App {
                     style::fg("—", t::FG_DIM),
                     style::fg(&artists, t::FG),
                     style::fg(&format!("[{} {}]", shuffle, repeat), t::FG_DIM)));
-                lines.push(format!("{}{}  {}  {}",
+                lines.push(format!("{} {}  {}  {}",
                     pad,
                     style::fg(&fmt_ms(progress_ms), t::FG_DIM),
                     bar,
@@ -424,7 +423,7 @@ impl App {
         // space beneath the artwork.
         let placed = display.show(
             &cache_path.to_string_lossy(),
-            COVER_X, rows.saturating_sub(NOW_H) + 1,
+            COVER_X, rows.saturating_sub(NOW_H),
             self.cover_w, NOW_H);
         if placed { self.cover_track_id = Some(track_id); }
     }
@@ -469,7 +468,7 @@ impl App {
         let (_, rows) = Crust::terminal_size();
         if let Some(d) = self.cover_display.as_mut() {
             let (cols, _) = Crust::terminal_size();
-            d.clear(COVER_X, rows.saturating_sub(NOW_H) + 1,
+            d.clear(COVER_X, rows.saturating_sub(NOW_H),
                     self.cover_w, NOW_H, cols, rows);
         }
         self.cover_track_id = None;
@@ -1143,22 +1142,28 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// Pick (track_id, smallest_cover_url) out of a playback item. Returns
+/// Pick (track_id, cover_url) out of a playback item. Returns
 /// None when the item has no id or no images — both legitimate
 /// (private content, ad slot, podcast trailer with no cover).
+///
+/// Picks the LARGEST image Spotify offers (typically 640×640) so
+/// glow's aspect-preserving resize can shrink it to fill the
+/// now-playing strip's pixel box. Picking the smallest (64×64)
+/// would leave the cover stranded at native pixel size in a much
+/// larger box — glow's `convert -resize WxH>` only shrinks.
 fn cover_id_and_url(item: &PlayableItem) -> Option<(String, String)> {
     match item {
         PlayableItem::Track(t) => {
             let id = t.id.as_ref()?.id().to_string();
             let url = t.album.images.iter()
-                .min_by_key(|i| i.width.unwrap_or(u32::MAX))
+                .max_by_key(|i| i.width.unwrap_or(0))
                 .map(|i| i.url.clone())?;
             Some((id, url))
         }
         PlayableItem::Episode(e) => {
             let id = e.id.id().to_string();
             let url = e.images.iter()
-                .min_by_key(|i| i.width.unwrap_or(u32::MAX))
+                .max_by_key(|i| i.width.unwrap_or(0))
                 .map(|i| i.url.clone())?;
             Some((id, url))
         }
@@ -1170,8 +1175,8 @@ fn cover_id_and_url(item: &PlayableItem) -> Option<(String, String)> {
                 .or_else(|| j.get("images"))
                 .and_then(|v| v.as_array())?;
             let url = images.iter()
-                .min_by_key(|i| i.get("width")
-                    .and_then(|w| w.as_u64()).unwrap_or(u64::MAX))
+                .max_by_key(|i| i.get("width")
+                    .and_then(|w| w.as_u64()).unwrap_or(0))
                 .and_then(|i| i.get("url").and_then(|u| u.as_str()))
                 .map(String::from)?;
             Some((id, url))
@@ -1183,7 +1188,12 @@ fn cover_cache_path(track_id: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let dir = PathBuf::from(home).join(".tune").join("cover_cache");
     let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!("{}.jpg", track_id))
+    // Suffix the cache filename with the cover size class — bumping
+    // from "smallest" (64 px) to "largest" (640 px) earlier in this
+    // file means old 64-px caches now look stretched in the strip.
+    // The "_lg" tag keeps them in separate buckets so the user
+    // doesn't have to manually wipe ~/.tune/cover_cache.
+    dir.join(format!("{}_lg.jpg", track_id))
 }
 
 /// Like `cover_id_and_url` but picks the *largest* image for the
