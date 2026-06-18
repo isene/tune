@@ -100,6 +100,44 @@ pub fn authorize(spotify: &mut AuthCodePkceSpotify) -> Result<(), String> {
     Ok(())
 }
 
+/// Remove the on-disk token cache so the next authorize starts clean.
+/// Called when Spotify rejects the refresh token (`invalid_grant`).
+pub fn discard_token_cache() {
+    let _ = std::fs::remove_file(token_cache_path());
+}
+
+/// Refresh the access token, recovering from an expired or revoked refresh
+/// token. From 2026-07-20 Spotify expires refresh tokens six months after
+/// issuance; the refresh then fails with `invalid_grant`. Per Spotify's
+/// guidance we must NOT retry the dead token — discard it and send the user
+/// back through sign-in. Returns Ok(true) when a re-authorization ran,
+/// Ok(false) on a normal refresh, and Err on a transient (e.g. network)
+/// failure where the cached token is still worth keeping.
+pub fn refresh_or_reauthorize(spotify: &mut AuthCodePkceSpotify) -> Result<bool, String> {
+    use rspotify::clients::BaseClient;
+    match spotify.refresh_token() {
+        Ok(()) => Ok(false),
+        Err(e) => {
+            // `invalid_grant` (or a bare 400/401 from the token endpoint)
+            // means the refresh token is dead, not a transient blip.
+            let m = e.to_string().to_lowercase();
+            let token_dead = m.contains("invalid_grant")
+                || m.contains("invalid grant")
+                || m.contains("400")
+                || m.contains("401")
+                || m.contains("unauthorized");
+            if token_dead {
+                eprintln!("tune: Spotify refresh token expired/revoked — re-authorizing.");
+                discard_token_cache();
+                if let Ok(mut g) = spotify.get_token().lock() { *g = None; }
+                authorize(spotify).map(|_| true)
+            } else {
+                Err(format!("refresh_token: {}", e))
+            }
+        }
+    }
+}
+
 /// Read one HTTP request off the listener, pull `code=…` out of the
 /// request line, write a brief success page back, and return the
 /// code. We don't bother with HTTP parsing — Spotify's redirect is a

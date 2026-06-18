@@ -1398,6 +1398,12 @@ fn main() {
         }
     } else if let Some(tok) = cached {
         *spotify.get_token().lock().unwrap() = Some(tok);
+        // Proactively refresh. From 2026-07-20 Spotify expires refresh
+        // tokens after six months; if ours is dead, re-authorize now
+        // rather than letting every later API call fail with invalid_grant.
+        if let Err(e) = auth::refresh_or_reauthorize(&mut spotify) {
+            eprintln!("tune: token refresh failed ({}); continuing with cached token.", e);
+        }
     }
 
     // Spawn the librespot Spirc session BEFORE entering the TUI so
