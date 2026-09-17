@@ -123,9 +123,15 @@ struct App {
     /// Your stations, and the ones the last search found.
     stations: Vec<radio::Station>,
     found: Vec<radio::Station>,
-    /// Empty while the Radio view shows your stations.
+    /// What the Radio view shows besides your stations, as its heading:
+    /// `Stations for "jazz"`, `Stations in NO`. Empty shows yours.
+    found_title: String,
+    /// Last station search and country, offered again at the prompt.
     radio_query: String,
+    radio_country: String,
     radio_idx: usize,
+    /// The refresh token, kept so a refresh that drops it can be undone.
+    refresh_kept: Option<String>,
 }
 
 /// Height of the now-playing strip in rows. Sized so the strip is
@@ -183,6 +189,7 @@ impl App {
         let files_dir = [music, home.join("Music")].into_iter()
             .find(|p| p.is_dir()).unwrap_or(home);
 
+        let refresh_kept = auth::refresh_token_of(&spotify);
         let user_display_name = spotify.current_user().ok()
             .map(|u| u.display_name.unwrap_or_else(|| u.id.id().to_string()))
             .unwrap_or_default();
@@ -217,7 +224,9 @@ impl App {
             files: Vec::new(),          files_idx: 0,
             stations: Vec::new(),
             found: Vec::new(),
-            radio_query: String::new(), radio_idx: 0,
+            found_title: String::new(),
+            radio_query: String::new(), radio_country: String::new(), radio_idx: 0,
+            refresh_kept,
         }
     }
 
@@ -562,6 +571,7 @@ impl App {
     }
 
     fn poll_state(&mut self) {
+        auth::keep_refresh_token(&self.spotify, &mut self.refresh_kept);
         if self.local.is_some() { return; }
         if self.last_poll.elapsed() < self.poll_interval { return; }
         self.last_poll = std::time::Instant::now();
@@ -787,7 +797,7 @@ impl App {
             ("Q", "Up-next queue"),
             ("d", "Devices (Spotify Connect)"),
             ("f", "Files: folders and audio files on this computer"),
-            ("t", "Radio: your stations; / finds more"),
+            ("t", "Radio: your stations; / finds more, c lists a country's"),
             ("?", "This help"),
         ] {
             out.push(format!("    {:<8} {}", k(key), desc));
@@ -846,6 +856,7 @@ impl App {
             // ---- view switching ----
             "?"  => { self.view = View::Help;       self.main_p.ix = 0; }
             "/" if self.view == View::Radio => self.radio_search_prompt(),
+            "c" if self.view == View::Radio => self.radio_country_prompt(),
             "/"  => { self.view = View::Search;     self.main_p.ix = 0;
                       self.search_prompt(); }
             "P"  => { self.view = View::Playlists;  self.main_p.ix = 0;
@@ -860,7 +871,7 @@ impl App {
                       if self.files.is_empty() { self.load_files(); } }
             "t" if self.view == View::Radio => {
                 // Back from search results to your own stations.
-                self.radio_query.clear(); self.found.clear();
+                self.found_title.clear(); self.found.clear();
                 self.radio_idx = 0;                 self.main_p.ix = 0;
             }
             "t"  => { self.view = View::Radio;      self.main_p.ix = 0;
@@ -1294,7 +1305,7 @@ impl App {
     }
 
     fn radio_list(&self) -> &[radio::Station] {
-        if self.radio_query.is_empty() { &self.stations } else { &self.found }
+        if self.found_title.is_empty() { &self.stations } else { &self.found }
     }
 
     fn play_station(&mut self) {
@@ -1311,11 +1322,29 @@ impl App {
         let q = q.trim().to_string();
         if q.is_empty() { return; }
         self.set_status("Searching radio-browser.info…", t::FG_MUTED);
-        match radio::search(&q) {
+        let found = radio::search(&q);
+        self.show_found(found, format!("Stations for \"{}\"", q));
+        self.radio_query = q;
+    }
+
+    fn radio_country_prompt(&mut self) {
+        Cursor::show();
+        let c = self.footer.ask(" country, code or name (NO, Norway): ", &self.radio_country);
+        Cursor::hide();
+        let c = c.trim().to_string();
+        if c.is_empty() { return; }
+        self.set_status("Asking radio-browser.info…", t::FG_MUTED);
+        let found = radio::in_country(&c);
+        self.show_found(found, format!("Stations in {}", c));
+        self.radio_country = c;
+    }
+
+    fn show_found(&mut self, found: Result<Vec<radio::Station>, String>, title: String) {
+        match found {
             Ok(found) => {
                 let n = found.len();
                 self.found = found;
-                self.radio_query = q;
+                self.found_title = title;
                 self.radio_idx = 0;
                 self.main_p.ix = 0;
                 self.set_status(&format!("{} stations. ENTER plays, a keeps one, t goes back to yours.", n), t::OK);
@@ -1339,7 +1368,7 @@ impl App {
 
     /// Remove a station from your own list (not from search results).
     fn forget_station(&mut self) {
-        if !self.radio_query.is_empty() || self.radio_idx >= self.stations.len() { return; }
+        if !self.found_title.is_empty() || self.radio_idx >= self.stations.len() { return; }
         let st = self.stations.remove(self.radio_idx);
         self.radio_idx = self.radio_idx.min(self.stations.len().saturating_sub(1));
         match radio::save(&self.stations) {
@@ -1468,19 +1497,19 @@ impl App {
 
     fn lines_radio(&self, out: &mut Vec<String>) {
         out.push(String::new());
-        let (title, hint) = if self.radio_query.is_empty() {
-            ("Your stations".to_string(), "/ finds more · ENTER plays · D removes")
+        let (title, hint) = if self.found_title.is_empty() {
+            ("Your stations", "/ finds more · c lists a country · ENTER plays · D removes")
         } else {
-            (format!("Stations for \"{}\"", self.radio_query), "ENTER plays · a keeps it · t goes back to yours")
+            (self.found_title.as_str(), "ENTER plays · a keeps it · t goes back to yours")
         };
         out.push(format!("  {}  {}",
-            style::bold(&style::fg(&title, t::ACCENT)),
+            style::bold(&style::fg(title, t::ACCENT)),
             style::fg(hint, t::FG_DIM)));
         out.push(String::new());
         let list = self.radio_list();
         if list.is_empty() {
-            let msg = if self.radio_query.is_empty() {
-                "(none yet: press / to find a station by name, or by a tag like jazz or news)"
+            let msg = if self.found_title.is_empty() {
+                "(none yet: press / to find a station by name or by a tag like jazz, or c for a country)"
             } else { "(no stations found)" };
             out.push(format!("  {}", style::fg(msg, t::FG_DIM)));
             return;
@@ -1829,14 +1858,11 @@ fn main() {
     // lifetime of main(); dropping it on quit tears down Spirc and
     // de-registers the device from Spotify Connect.
     //
-    // Force a token refresh before handing the access_token to
-    // librespot. Spotify's AP server is stricter about token
-    // freshness than the Web API — a token that's 5+ minutes old
-    // can be rejected with "Bad credentials" even when expires_at
-    // is still 50 minutes in the future. Refreshing right before
-    // librespot's login attempt cuts that failure mode dramatically.
+    // librespot wants a fresh access token: Spotify's AP server can
+    // reject one that is 5+ minutes old. The refresh or sign-in just
+    // above made it seconds ago. (A second refresh here used to cost
+    // the refresh token whenever Spotify's answer left it out.)
     let _local_player = if cfg.local_player {
-        let _ = spotify.refresh_token();
         let access_token = spotify.get_token()
             .lock()
             .ok()

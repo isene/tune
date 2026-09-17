@@ -13,6 +13,7 @@
 //! transparently on the next API call when the access token is near
 //! expiry — rspotify's `AuthCodePkceSpotify` handles that internally.
 
+use rspotify::clients::BaseClient;
 use rspotify::{AuthCodePkceSpotify, Config, Credentials, OAuth};
 use rspotify::scopes;
 use std::io::{BufRead, BufReader, Write};
@@ -106,22 +107,64 @@ pub fn discard_token_cache() {
     let _ = std::fs::remove_file(token_cache_path());
 }
 
+/// Refresh the access token and hold on to the refresh token. Spotify
+/// sends a new refresh token only sometimes. When it sends none, rspotify
+/// stores none, and its next refresh then clears the whole token, so every
+/// API call fails. Errors when there is no refresh token to refresh with.
+pub fn refresh(spotify: &AuthCodePkceSpotify) -> Result<(), String> {
+    let mut kept = refresh_token_of(spotify);
+    if kept.is_none() { return Err("no refresh token".into()); }
+    spotify.refresh_token().map_err(|e| e.to_string())?;
+    keep_refresh_token(spotify, &mut kept);
+    Ok(())
+}
+
+/// The refresh token tune holds now, if any.
+pub fn refresh_token_of(spotify: &AuthCodePkceSpotify) -> Option<String> {
+    let token = spotify.get_token();
+    let guard = token.lock().ok()?;
+    guard.as_ref()?.refresh_token.clone()
+}
+
+/// Remember the current refresh token in `kept`, or put `kept` back (and
+/// save it) when a refresh left the token without one. rspotify refreshes
+/// on its own when the access token runs out, so main calls this before
+/// every poll; it only locks and compares.
+pub fn keep_refresh_token(spotify: &AuthCodePkceSpotify, kept: &mut Option<String>) {
+    let token = spotify.get_token();
+    let mended = {
+        let Ok(mut guard) = token.lock() else { return };
+        let Some(tok) = guard.as_mut() else { return };
+        if let Some(now) = &tok.refresh_token {
+            if kept.as_deref() != Some(now.as_str()) { *kept = Some(now.clone()); }
+            false
+        } else if let Some(k) = kept.as_ref() {
+            tok.refresh_token = Some(k.clone());
+            true
+        } else {
+            false
+        }
+    };
+    if mended { let _ = spotify.write_token_cache(); }
+}
+
 /// Refresh the access token, recovering from an expired or revoked refresh
-/// token. From 2026-07-20 Spotify expires refresh tokens six months after
+/// token (or a cached token that has none). From 2026-07-20 Spotify expires refresh tokens six months after
 /// issuance; the refresh then fails with `invalid_grant`. Per Spotify's
 /// guidance we must NOT retry the dead token — discard it and send the user
 /// back through sign-in. Returns Ok(true) when a re-authorization ran,
 /// Ok(false) on a normal refresh, and Err on a transient (e.g. network)
 /// failure where the cached token is still worth keeping.
 pub fn refresh_or_reauthorize(spotify: &mut AuthCodePkceSpotify) -> Result<bool, String> {
-    use rspotify::clients::BaseClient;
-    match spotify.refresh_token() {
+    match refresh(spotify) {
         Ok(()) => Ok(false),
         Err(e) => {
             // `invalid_grant` (or a bare 400/401 from the token endpoint)
-            // means the refresh token is dead, not a transient blip.
-            let m = e.to_string().to_lowercase();
-            let token_dead = m.contains("invalid_grant")
+            // means the refresh token is dead, not a transient blip. So
+            // does having none at all.
+            let m = e.to_lowercase();
+            let token_dead = m.contains("no refresh token")
+                || m.contains("invalid_grant")
                 || m.contains("invalid grant")
                 || m.contains("400")
                 || m.contains("401")
@@ -216,4 +259,44 @@ fn urldecode(s: &str) -> String {
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client that never writes the token cache.
+    fn client(refresh: Option<&str>) -> AuthCodePkceSpotify {
+        let spotify = AuthCodePkceSpotify::with_config(Credentials::new_pkce("test"), OAuth::default(), Config::default());
+        let tok = rspotify::Token { access_token: "a".into(), refresh_token: refresh.map(String::from), ..Default::default() };
+        *spotify.get_token().lock().unwrap() = Some(tok);
+        spotify
+    }
+
+    fn set_refresh(spotify: &AuthCodePkceSpotify, refresh: Option<&str>) {
+        let token = spotify.get_token();
+        let mut guard = token.lock().unwrap();
+        guard.as_mut().unwrap().refresh_token = refresh.map(String::from);
+    }
+
+    #[test]
+    fn a_refresh_token_lost_in_a_refresh_is_put_back() {
+        let spotify = client(Some("r1"));
+        let mut kept = None;
+        keep_refresh_token(&spotify, &mut kept);
+        assert_eq!(kept.as_deref(), Some("r1"));
+        set_refresh(&spotify, None);
+        keep_refresh_token(&spotify, &mut kept);
+        assert_eq!(refresh_token_of(&spotify).as_deref(), Some("r1"), "put back");
+        set_refresh(&spotify, Some("r2"));
+        keep_refresh_token(&spotify, &mut kept);
+        assert_eq!(kept.as_deref(), Some("r2"), "a new one is kept instead");
+    }
+
+    #[test]
+    fn with_no_refresh_token_a_refresh_fails_and_keeps_the_token() {
+        let spotify = client(None);
+        assert_eq!(refresh(&spotify), Err("no refresh token".to_string()));
+        assert!(spotify.get_token().lock().unwrap().is_some(), "rspotify would have cleared it");
+    }
 }

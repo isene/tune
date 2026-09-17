@@ -35,18 +35,37 @@ fn agent() -> String {
 /// Stations whose name matches `query`, most played first. When no name
 /// matches, stations tagged with it (jazz, news, classical).
 pub fn search(query: &str) -> Result<Vec<Station>, String> {
-    let by_name = fetch("name", query)?;
+    let by_name = fetch(&[("name", query)], 100)?;
     if !by_name.is_empty() { return Ok(by_name); }
-    fetch("tag", query)
+    fetch(&[("tag", query)], 100)
 }
 
-fn fetch(field: &str, query: &str) -> Result<Vec<Station>, String> {
+/// A country's stations, most played first: by two-letter code (NO) or
+/// by the start of its English name (Norway).
+pub fn in_country(country: &str) -> Result<Vec<Station>, String> {
+    let c = country.trim();
+    if c.len() == 2 && c.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return fetch(&[("countrycode", &c.to_ascii_uppercase())], 500);
+    }
+    fetch(&[("country", &country_name(c))], 500)
+}
+
+/// The directory matches country names letter case and all: "Norway",
+/// "United Kingdom".
+fn country_name(s: &str) -> String {
+    s.split_whitespace().map(|w| {
+        let mut chars = w.chars();
+        chars.next().map(|f| f.to_uppercase().chain(chars.flat_map(|c| c.to_lowercase())).collect::<String>()).unwrap_or_default()
+    }).collect::<Vec<_>>().join(" ")
+}
+
+fn fetch(filter: &[(&str, &str)], limit: usize) -> Result<Vec<Station>, String> {
     let mut last = String::new();
     for server in SERVERS {
-        let resp = ureq::get(&format!("{}/json/stations/search", server))
-            .set("User-Agent", &agent())
-            .query(field, query)
-            .query("limit", "100")
+        let mut req = ureq::get(&format!("{}/json/stations/search", server)).set("User-Agent", &agent());
+        for (field, value) in filter { req = req.query(field, value); }
+        let resp = req
+            .query("limit", &limit.to_string())
             .query("hidebroken", "true")
             .query("order", "clickcount")
             .query("reverse", "true")
@@ -120,5 +139,11 @@ mod tests {
         let no_resolved = serde_json::json!({"name": "X", "url": "http://a/x"});
         assert_eq!(station(&no_resolved).unwrap().url, "http://a/x");
         assert!(station(&serde_json::json!({"name": "Y"})).is_none());
+    }
+
+    #[test]
+    fn country_names_are_capitalized_the_way_the_directory_has_them() {
+        assert_eq!(country_name("norway"), "Norway");
+        assert_eq!(country_name("united  KINGDOM"), "United Kingdom");
     }
 }
