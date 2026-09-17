@@ -35,6 +35,11 @@ pub struct Config {
     /// multiple machines: "tune (laptop)", "tune (desktop)", etc.
     #[serde(default = "default_device_name")]
     pub device_name: String,
+
+    /// Where the Files view (`f`) starts. Empty = `~/Music`, or your
+    /// home folder when there is none.
+    #[serde(default)]
+    pub music_dir: String,
 }
 
 fn default_poll_s() -> u64 { 2 }

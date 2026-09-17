@@ -3,15 +3,18 @@
 //! Architecture: rspotify (sync, ureq backend) for all API calls;
 //! crust for the panes. Single foreground thread — Spotify state
 //! polled at `config.poll_s` cadence (default 2s) from the input
-//! loop, between key events.
+//! loop, between key events. Local files and internet radio play
+//! through mpv (`local.rs`); while mpv is on, the Spotify poll rests.
 
 mod auth;
 mod config;
+mod local;
 mod player;
+mod radio;
 
 use crust::{Crust, Cursor, Input, Pane, style};
 use glow::Display;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use rspotify::{AuthCodePkceSpotify};
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::model::{
@@ -40,6 +43,8 @@ enum View {
     Saved,
     Queue,
     Devices,
+    Files,
+    Radio,
     Help,
 }
 
@@ -103,6 +108,24 @@ struct App {
     /// stable across resizes on every terminal we care about, but
     /// re-sampling is cheap insurance).
     cover_w: u16,
+
+    /// Local files and radio, played by mpv. While it is on, the
+    /// now-playing strip and the transport keys belong to it.
+    local: Option<local::Mpv>,
+    /// The file or station whose picture was last looked for, so the
+    /// folder is not searched again every second.
+    cover_checked: String,
+    /// tune's own Spotify Connect device, paused when mpv starts.
+    device_name: String,
+    files_dir: PathBuf,
+    files: Vec<(PathBuf, bool)>,
+    files_idx: usize,
+    /// Your stations, and the ones the last search found.
+    stations: Vec<radio::Station>,
+    found: Vec<radio::Station>,
+    /// Empty while the Radio view shows your stations.
+    radio_query: String,
+    radio_idx: usize,
 }
 
 /// Height of the now-playing strip in rows. Sized so the strip is
@@ -135,7 +158,8 @@ fn cover_cell_width_for_height(rows: u16) -> u16 {
 }
 
 impl App {
-    fn new(spotify: AuthCodePkceSpotify, poll_s: u64, default_device: String) -> Self {
+    fn new(spotify: AuthCodePkceSpotify, poll_s: u64, default_device: String,
+           device_name: String, music_dir: &str) -> Self {
         let (cols, rows) = Crust::terminal_size();
         let header = Pane::new(1, 1, cols, 1, t::FG_BRIGHT as u16, t::BG_BAR as u16);
         let main_p = Pane::new(1, 2, cols, rows.saturating_sub(2 + NOW_H + 1),
@@ -150,6 +174,14 @@ impl App {
         let mut header = header; header.wrap = false; header.scroll = false;
         let mut footer = footer; footer.wrap = false; footer.scroll = false;
         let mut now_p  = now_p;  now_p.wrap  = false; now_p.scroll  = false;
+
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+        let music = match music_dir.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(music_dir),
+        };
+        let files_dir = [music, home.join("Music")].into_iter()
+            .find(|p| p.is_dir()).unwrap_or(home);
 
         let user_display_name = spotify.current_user().ok()
             .map(|u| u.display_name.unwrap_or_else(|| u.id.id().to_string()))
@@ -178,6 +210,14 @@ impl App {
             cover_display: None,
             cover_track_id: None,
             cover_w: cover_cell_width_for_height(NOW_H),
+            local: None,
+            cover_checked: String::new(),
+            device_name,
+            files_dir,
+            files: Vec::new(),          files_idx: 0,
+            stations: Vec::new(),
+            found: Vec::new(),
+            radio_query: String::new(), radio_idx: 0,
         }
     }
 
@@ -226,8 +266,12 @@ impl App {
     }
 
     fn render_header(&mut self) {
-        let dev = self.playback.as_ref()
-            .map(|p| p.device.name.as_str()).unwrap_or("—");
+        let dev = match self.local.as_ref().map(|m| &m.source) {
+            Some(local::Source::Files)    => "local files",
+            Some(local::Source::Radio(_)) => "radio",
+            None => self.playback.as_ref().map(|p| p.device.name.as_str()).unwrap_or("—"),
+        };
+        let files_lbl;
         let view_lbl = match self.view {
             View::Search          => "Search",
             View::Playlists       => "Playlists",
@@ -236,6 +280,8 @@ impl App {
             View::Saved           => "Saved",
             View::Queue           => "Queue",
             View::Devices         => "Devices",
+            View::Files           => { files_lbl = tilde(&self.files_dir); files_lbl.as_str() }
+            View::Radio           => "Radio",
             View::Help            => "Help",
         };
         let left = format!(" tune  [{}]", style::bold(&style::fg(view_lbl, t::ACCENT)));
@@ -258,6 +304,8 @@ impl App {
             View::Saved           => self.lines_saved(&mut lines),
             View::Queue           => self.lines_queue(&mut lines),
             View::Devices         => self.lines_devices(&mut lines),
+            View::Files           => self.lines_files(&mut lines),
+            View::Radio           => self.lines_radio(&mut lines),
             View::Help            => self.lines_help(&mut lines),
         }
         self.main_p.set_text(&lines.join("\n"));
@@ -301,6 +349,12 @@ impl App {
         let pad = " ".repeat((COVER_X + self.cover_w) as usize);
         let mut lines: Vec<String> = Vec::new();
         lines.push(String::new());
+        if let Some(m) = &self.local {
+            self.lines_local_now(m, &pad, &mut lines);
+            self.now_p.set_text(&lines.join("\n"));
+            self.now_p.refresh();
+            return;
+        }
         match &self.playback {
             None => {
                 lines.push(format!("{}{}", pad,
@@ -365,7 +419,7 @@ impl App {
         let (msg, col) = match &self.status {
             Some((m, c)) => (m.clone(), *c),
             None => (
-                " /:search  P:playlists  L:saved  Q:queue  d:devices  ?:help  q:quit ".to_string(),
+                " /:search  P:playlists  L:saved  Q:queue  d:devices  f:files  t:radio  ?:help  q:quit ".to_string(),
                 t::FG_MUTED,
             ),
         };
@@ -478,6 +532,24 @@ impl App {
         let elapsed = self.last_progress_tick.elapsed();
         if elapsed < std::time::Duration::from_secs(1) { return; }
         self.last_progress_tick = std::time::Instant::now();
+        if let Some(m) = self.local.as_mut() {
+            // Paused, mpv has nothing new to say; only check it is still there.
+            let paused = m.state.paused;
+            let was = m.state.path.clone();
+            let alive = if paused { m.running() } else { m.refresh() };
+            let moved = m.state.path != was;
+            if !alive {
+                self.stop_local();
+                self.set_status("Played to the end", t::FG_MUTED);
+                self.render_main();
+            } else if !paused {
+                self.sync_local_cover();
+                self.render_now();
+                // A new track: move the ♪ in the Files list.
+                if moved && self.view == View::Files { self.render_main(); }
+            }
+            return;
+        }
         let is_playing = self.playback.as_ref().map(|p| p.is_playing).unwrap_or(false);
         if !is_playing { return; }
         if let Some(pb) = self.playback.as_mut() {
@@ -490,6 +562,7 @@ impl App {
     }
 
     fn poll_state(&mut self) {
+        if self.local.is_some() { return; }
         if self.last_poll.elapsed() < self.poll_interval { return; }
         self.last_poll = std::time::Instant::now();
         let additional = &[AdditionalType::Track, AdditionalType::Episode];
@@ -703,6 +776,8 @@ impl App {
         out.push(String::new());
         out.push(format!("  {}", style::bold(&style::fg(
             "tune — keys", t::ACCENT))));
+        out.push(format!("  {}", style::fg(
+            "Local files and radio play through mpv; the playback keys work on them too.", t::FG_DIM)));
         out.push(String::new());
         out.push(format!("  {}", h("Views")));
         for (key, desc) in [
@@ -711,6 +786,8 @@ impl App {
             ("L", "Liked / saved tracks"),
             ("Q", "Up-next queue"),
             ("d", "Devices (Spotify Connect)"),
+            ("f", "Files: folders and audio files on this computer"),
+            ("t", "Radio: your stations; / finds more"),
             ("?", "This help"),
         ] {
             out.push(format!("    {:<8} {}", k(key), desc));
@@ -735,7 +812,7 @@ impl App {
             ("g / G",  "Top / bottom"),
             ("ENTER",  "Play this item / open playlist"),
             ("a",      "Add this track to the queue"),
-            ("h",      "Back to playlist list"),
+            ("h",      "Back to playlist list, or up a folder"),
         ] {
             out.push(format!("    {:<8} {}", k(key), desc));
         }
@@ -743,6 +820,7 @@ impl App {
         out.push(format!("  {}", h("Misc")));
         for (key, desc) in [
             ("v",      "View full album cover in your image viewer"),
+            ("x",      "Stop local files or radio"),
             ("R",      "Refresh now-playing"),
             ("q",      "Quit"),
         ] {
@@ -767,6 +845,7 @@ impl App {
         match key {
             // ---- view switching ----
             "?"  => { self.view = View::Help;       self.main_p.ix = 0; }
+            "/" if self.view == View::Radio => self.radio_search_prompt(),
             "/"  => { self.view = View::Search;     self.main_p.ix = 0;
                       self.search_prompt(); }
             "P"  => { self.view = View::Playlists;  self.main_p.ix = 0;
@@ -777,8 +856,25 @@ impl App {
                       self.ensure_queue_loaded(); }
             "d"  => { self.view = View::Devices;    self.main_p.ix = 0;
                       self.load_devices(); }
+            "f"  => { self.view = View::Files;      self.main_p.ix = 0;
+                      if self.files.is_empty() { self.load_files(); } }
+            "t" if self.view == View::Radio => {
+                // Back from search results to your own stations.
+                self.radio_query.clear(); self.found.clear();
+                self.radio_idx = 0;                 self.main_p.ix = 0;
+            }
+            "t"  => { self.view = View::Radio;      self.main_p.ix = 0;
+                      self.stations = radio::saved(); }
             "h" if self.view == View::PlaylistTracks => {
                 self.view = View::Playlists;        self.main_p.ix = 0;
+            }
+            "h" | "LEFT" | "BACK" if self.view == View::Files => self.files_up(),
+            "a" if self.view == View::Files => self.append_file(),
+            "a" if self.view == View::Radio => self.keep_station(),
+            "D" if self.view == View::Radio => self.forget_station(),
+            "x" if self.local.is_some() => {
+                self.stop_local();
+                self.set_status("Stopped", t::FG_MUTED);
             }
             // ---- list navigation ----
             "j" | "DOWN" => self.list_down(),
@@ -800,6 +896,7 @@ impl App {
             "s"           => self.toggle_shuffle(),
             "r"           => self.cycle_repeat(),
             "R"           => { self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
+                              self.refresh_local_soon();
                               self.poll_state(); }
             "v"           => self.show_cover_external(),
             _ => {}
@@ -870,6 +967,8 @@ impl App {
             View::Saved           => (self.saved_idx,           Some(self.saved_tracks.len())),
             View::Queue           => (self.queue_idx,           Some(self.queue.len())),
             View::Devices         => (self.devices_idx,         Some(self.devices.len())),
+            View::Files           => (self.files_idx,           Some(self.files.len())),
+            View::Radio           => (self.radio_idx,           Some(self.radio_list().len())),
             View::Help            => (0, None),
         }
     }
@@ -881,6 +980,8 @@ impl App {
             View::Saved           => self.saved_idx = i,
             View::Queue           => self.queue_idx = i,
             View::Devices         => self.devices_idx = i,
+            View::Files           => self.files_idx = i,
+            View::Radio           => self.radio_idx = i,
             View::Help            => {}
         }
     }
@@ -900,6 +1001,13 @@ impl App {
     }
 
     fn list_activate(&mut self) {
+        match self.view {
+            View::Files => { self.activate_file(); return; }
+            View::Radio => { self.play_station(); return; }
+            // Anything that starts Spotify playing ends mpv first.
+            View::PlaylistTracks | View::Search | View::Saved | View::Queue | View::Devices => self.stop_local(),
+            View::Playlists | View::Help => {}
+        }
         match self.view {
             View::Playlists => {
                 if let Some(pl) = self.playlists.get(self.playlists_idx).cloned() {
@@ -1000,7 +1108,7 @@ impl App {
                     }
                 }
             }
-            View::Help => {}
+            View::Files | View::Radio | View::Help => {}
         }
         self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
         self.poll_state();
@@ -1017,6 +1125,11 @@ impl App {
     }
 
     fn toggle_play(&mut self) {
+        if let Some(m) = self.local.as_mut() {
+            m.toggle_pause();
+            self.render_now();
+            return;
+        }
         let Some(device_id) = self.resolve_device_id() else {
             self.set_status(
                 "No Spotify Connect devices online — open Spotify on a phone or desktop first.",
@@ -1046,12 +1159,14 @@ impl App {
     }
 
     fn skip_next(&mut self) {
+        if let Some(m) = self.local.as_mut() { m.next(); self.refresh_local_soon(); return; }
         let device_id = self.resolve_device_id();
         let _ = self.spotify.next_track(device_id.as_deref());
         self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
         self.poll_state();
     }
     fn skip_prev(&mut self) {
+        if let Some(m) = self.local.as_mut() { m.prev(); self.refresh_local_soon(); return; }
         let device_id = self.resolve_device_id();
         let _ = self.spotify.previous_track(device_id.as_deref());
         self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
@@ -1059,6 +1174,12 @@ impl App {
     }
 
     fn bump_volume(&mut self, delta: i32) {
+        if let Some(m) = self.local.as_mut() {
+            m.add_volume(delta as i64);
+            let v = m.volume;
+            self.set_status(&format!("Volume: {}%", v), t::OK);
+            return;
+        }
         let cur = self.playback.as_ref()
             .and_then(|p| p.device.volume_percent.map(|v| v as i32))
             .unwrap_or(50);
@@ -1074,6 +1195,7 @@ impl App {
     }
 
     fn seek_relative(&mut self, delta_ms: i64) {
+        if let Some(m) = self.local.as_mut() { m.seek(delta_ms / 1000); self.refresh_local_soon(); return; }
         let cur = self.playback.as_ref()
             .and_then(|p| p.progress.map(|d| d.num_milliseconds()))
             .unwrap_or(0);
@@ -1092,6 +1214,12 @@ impl App {
     }
 
     fn toggle_shuffle(&mut self) {
+        if let Some(m) = self.local.as_mut() {
+            m.shuffle();
+            self.set_status("Shuffled the list", t::OK);
+            self.refresh_local_soon();
+            return;
+        }
         let cur = self.playback.as_ref().map(|p| p.shuffle_state).unwrap_or(false);
         let device_id = self.resolve_device_id();
         let _ = self.spotify.shuffle(!cur, device_id.as_deref());
@@ -1100,6 +1228,7 @@ impl App {
     }
 
     fn cycle_repeat(&mut self) {
+        if let Some(m) = self.local.as_mut() { m.cycle_repeat(); self.render_now(); return; }
         let next = match self.playback.as_ref().map(|p| p.repeat_state).unwrap_or(RepeatState::Off) {
             RepeatState::Off     => RepeatState::Context,
             RepeatState::Context => RepeatState::Track,
@@ -1112,7 +1241,293 @@ impl App {
     }
 }
 
+impl App {
+    // ---- Local files and radio ----------------------------------------
+
+    /// Read mpv's state on the next pass of the main loop.
+    fn refresh_local_soon(&mut self) {
+        if self.local.is_some() {
+            self.last_progress_tick = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        }
+    }
+
+    fn load_files(&mut self) {
+        self.files = local::list_dir(&self.files_dir);
+        self.files_idx = 0;
+    }
+
+    fn files_up(&mut self) {
+        let Some(parent) = self.files_dir.parent().map(PathBuf::from) else { return };
+        let child = std::mem::replace(&mut self.files_dir, parent);
+        self.load_files();
+        // Land on the folder we came out of.
+        if let Some(i) = self.files.iter().position(|(p, _)| *p == child) { self.files_idx = i; }
+        self.main_p.ix = 0;
+        self.render_header();
+    }
+
+    /// Open a folder, or play a file and the rest of its folder after it.
+    fn activate_file(&mut self) {
+        let Some((path, is_dir)) = self.files.get(self.files_idx).cloned() else { return };
+        if is_dir {
+            self.files_dir = path;
+            self.load_files();
+            self.main_p.ix = 0;
+            self.render_header();
+            return;
+        }
+        let tracks: Vec<PathBuf> = self.files.iter().filter(|(_, d)| !d).map(|(p, _)| p.clone()).collect();
+        let index = tracks.iter().position(|p| *p == path).unwrap_or(0);
+        self.start_local(local::Source::Files, &tracks, index, file_name(&path));
+    }
+
+    /// Put the file under the cursor at the end of what plays.
+    fn append_file(&mut self) {
+        let Some((path, false)) = self.files.get(self.files_idx).cloned() else { return };
+        match self.local.as_mut() {
+            Some(m) if matches!(m.source, local::Source::Files) => {
+                m.append(&path);
+                self.set_status(&format!("Added {}", file_name(&path)), t::OK);
+            }
+            _ => self.start_local(local::Source::Files, std::slice::from_ref(&path), 0, file_name(&path)),
+        }
+    }
+
+    fn radio_list(&self) -> &[radio::Station] {
+        if self.radio_query.is_empty() { &self.stations } else { &self.found }
+    }
+
+    fn play_station(&mut self) {
+        let Some(st) = self.radio_list().get(self.radio_idx).cloned() else { return };
+        radio::count_play(&st.uuid);
+        let name = st.name.clone();
+        self.start_local(local::Source::Radio(st), &[], 0, name);
+    }
+
+    fn radio_search_prompt(&mut self) {
+        Cursor::show();
+        let q = self.footer.ask(" station or tag: ", &self.radio_query);
+        Cursor::hide();
+        let q = q.trim().to_string();
+        if q.is_empty() { return; }
+        self.set_status("Searching radio-browser.info…", t::FG_MUTED);
+        match radio::search(&q) {
+            Ok(found) => {
+                let n = found.len();
+                self.found = found;
+                self.radio_query = q;
+                self.radio_idx = 0;
+                self.main_p.ix = 0;
+                self.set_status(&format!("{} stations. ENTER plays, a keeps one, t goes back to yours.", n), t::OK);
+            }
+            Err(e) => self.set_status(&format!("Station search failed: {}", e), t::ERR),
+        }
+    }
+
+    fn keep_station(&mut self) {
+        let Some(st) = self.radio_list().get(self.radio_idx).cloned() else { return };
+        if self.stations.iter().any(|s| s.url == st.url) {
+            self.set_status("Already in your stations", t::FG_MUTED);
+            return;
+        }
+        self.stations.push(st.clone());
+        match radio::save(&self.stations) {
+            Ok(()) => self.set_status(&format!("Kept {}", st.name), t::OK),
+            Err(e) => self.set_status(&format!("Could not save ~/.tune/radio.yml: {}", e), t::ERR),
+        }
+    }
+
+    /// Remove a station from your own list (not from search results).
+    fn forget_station(&mut self) {
+        if !self.radio_query.is_empty() || self.radio_idx >= self.stations.len() { return; }
+        let st = self.stations.remove(self.radio_idx);
+        self.radio_idx = self.radio_idx.min(self.stations.len().saturating_sub(1));
+        match radio::save(&self.stations) {
+            Ok(()) => self.set_status(&format!("Removed {}", st.name), t::OK),
+            Err(e) => self.set_status(&format!("Could not save ~/.tune/radio.yml: {}", e), t::ERR),
+        }
+    }
+
+    fn start_local(&mut self, source: local::Source, files: &[PathBuf], index: usize, title: String) {
+        self.stop_local();
+        // Two streams out of one laptop is noise: pause tune's own Spotify device.
+        if self.playback.as_ref().is_some_and(|p| p.is_playing && p.device.name == self.device_name) {
+            let _ = self.spotify.pause_playback(None);
+        }
+        self.clear_cover();
+        match local::Mpv::start(source, files, index) {
+            Ok(mut m) => {
+                m.state.title = title;
+                self.local = Some(m);
+                self.refresh_local_soon();
+                self.render_header();
+                self.render_now();
+            }
+            Err(e) => self.set_status(
+                &format!("Local files and radio need mpv, which did not start: {}", e), t::ERR),
+        }
+    }
+
+    fn stop_local(&mut self) {
+        if self.local.take().is_none() { return; }
+        self.clear_cover();
+        self.cover_checked.clear();
+        // Spotify's state may have moved on meanwhile.
+        self.last_poll = std::time::Instant::now() - self.poll_interval * 2;
+        self.render_header();
+        self.render_now();
+    }
+
+    /// The picture beside a playing file, or a station's logo. Looked
+    /// for once per file or station.
+    fn sync_local_cover(&mut self) {
+        let Some(m) = &self.local else { return };
+        let (key, image) = match &m.source {
+            local::Source::Files => (m.state.path.clone(), local::folder_cover(Path::new(&m.state.path))),
+            local::Source::Radio(st) => {
+                let path = cover_cache_path(&format!("radio-{}", short_hash(&st.favicon)));
+                let got = !st.favicon.is_empty() && (path.exists() || download_cover(&st.favicon, &path).is_ok());
+                (st.url.clone(), got.then_some(path))
+            }
+        };
+        if key.is_empty() || key == self.cover_checked { return; }
+        self.cover_checked = key.clone();
+        self.clear_cover();
+        let Some(image) = image else { return };
+        let (_, rows) = Crust::terminal_size();
+        let display = self.cover_display.get_or_insert_with(Display::new);
+        display.show(&image.to_string_lossy(), COVER_X, rows.saturating_sub(NOW_H), self.cover_w, NOW_H);
+        // Marked even when it did not place, so a broken logo is not tried every second.
+        self.cover_track_id = Some(key);
+    }
+
+    fn lines_local_now(&self, m: &local::Mpv, pad: &str, lines: &mut Vec<String>) {
+        let s = &m.state;
+        let (symbol, symcol) = if s.paused { ("⏸", t::AMBER) } else { ("▶", t::OK) };
+        let repeat = match m.repeat {
+            local::Repeat::Off => "  ",
+            local::Repeat::List => "🔁",
+            local::Repeat::Track => "🔂",
+        };
+        let place = match &m.source {
+            local::Source::Files => format!("{}/{} {}", s.index + 1, s.count, repeat),
+            local::Source::Radio(_) => "radio".to_string(),
+        };
+        let artist = if s.artist.is_empty() { String::new() }
+            else { format!("  {}  {}", style::fg("—", t::FG_DIM), style::fg(&s.artist, t::FG)) };
+        lines.push(format!("{}{} {}{}  {}",
+            pad,
+            style::fg(symbol, symcol),
+            style::bold(&style::fg(&s.title, t::FG_BRIGHT)),
+            artist,
+            style::fg(&format!("[{}]", place), t::FG_DIM)));
+        match &m.source {
+            local::Source::Radio(st) => {
+                let quality = if st.bitrate > 0 { format!("{} {} kbit/s", st.codec, st.bitrate) } else { st.codec.clone() };
+                lines.push(format!("{} {}  {}", pad,
+                    style::fg("● live", t::ERR),
+                    style::fg(&quality, t::FG_DIM)));
+            }
+            local::Source::Files => {
+                let (pos, total) = ((s.pos * 1000.0) as u64, (s.duration * 1000.0) as u64);
+                let bar_w = (self.cols as usize).saturating_sub(pad.len() + 20);
+                lines.push(format!("{} {}  {}  {}", pad,
+                    style::fg(&fmt_ms(pos), t::FG_DIM),
+                    progress_bar(pos, total, bar_w),
+                    style::fg(&fmt_ms(total), t::FG_DIM)));
+            }
+        }
+    }
+
+    fn lines_files(&self, out: &mut Vec<String>) {
+        out.push(String::new());
+        out.push(format!("  {}  {}",
+            style::bold(&style::fg(&tilde(&self.files_dir), t::ACCENT)),
+            style::fg("ENTER opens or plays · h goes up · a adds to what plays", t::FG_DIM)));
+        out.push(String::new());
+        if self.files.is_empty() {
+            out.push(format!("  {}", style::fg("(no folders or audio files here)", t::FG_DIM)));
+            return;
+        }
+        let playing = self.local.as_ref()
+            .filter(|m| matches!(m.source, local::Source::Files))
+            .map(|m| m.state.path.as_str());
+        for (i, (path, is_dir)) in self.files.iter().enumerate() {
+            let selected = i == self.files_idx;
+            let cursor = if selected { "▸" } else { " " };
+            let mark = if playing == Some(path.to_string_lossy().as_ref()) { "♪" } else { " " };
+            let name = if *is_dir { format!("{}/", file_name(path)) } else { file_name(path) };
+            let line = format!("  {} {} {}", cursor, mark, truncate(&name, 80));
+            out.push(if selected {
+                style::bold(&style::fg(&line, t::FG_BRIGHT)).to_string()
+            } else if *is_dir {
+                style::fg(&line, t::CYAN).to_string()
+            } else { line });
+        }
+    }
+
+    fn lines_radio(&self, out: &mut Vec<String>) {
+        out.push(String::new());
+        let (title, hint) = if self.radio_query.is_empty() {
+            ("Your stations".to_string(), "/ finds more · ENTER plays · D removes")
+        } else {
+            (format!("Stations for \"{}\"", self.radio_query), "ENTER plays · a keeps it · t goes back to yours")
+        };
+        out.push(format!("  {}  {}",
+            style::bold(&style::fg(&title, t::ACCENT)),
+            style::fg(hint, t::FG_DIM)));
+        out.push(String::new());
+        let list = self.radio_list();
+        if list.is_empty() {
+            let msg = if self.radio_query.is_empty() {
+                "(none yet: press / to find a station by name, or by a tag like jazz or news)"
+            } else { "(no stations found)" };
+            out.push(format!("  {}", style::fg(msg, t::FG_DIM)));
+            return;
+        }
+        let playing = self.local.as_ref().and_then(|m| match &m.source {
+            local::Source::Radio(st) => Some(st.url.as_str()),
+            local::Source::Files => None,
+        });
+        for (i, st) in list.iter().enumerate() {
+            let selected = i == self.radio_idx;
+            let cursor = if selected { "▸" } else { " " };
+            let mark = if playing == Some(st.url.as_str()) { "♪" }
+                else if self.stations.iter().any(|s| s.url == st.url) { "★" } else { " " };
+            let quality = if st.bitrate > 0 { format!("{} {}k", st.codec, st.bitrate) } else { st.codec.clone() };
+            let line = format!("  {} {} {:<40}  {:<3} {:<11}",
+                cursor, mark, truncate(&st.name, 40), st.country, truncate(&quality, 11));
+            let tags = style::fg(&truncate(&st.tags, 40), t::FG_DIM);
+            out.push(if selected {
+                format!("{}  {}", style::bold(&style::fg(&line, t::FG_BRIGHT)), tags)
+            } else {
+                format!("{}  {}", line, tags)
+            });
+        }
+    }
+}
+
 // ---- Helpers --------------------------------------------------------
+
+fn file_name(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
+}
+
+/// A path with the home folder shown as ~.
+fn tilde(p: &Path) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match p.strip_prefix(&home) {
+        Ok(rest) if !home.is_empty() => format!("~/{}", rest.display()).trim_end_matches('/').to_string(),
+        _ => p.display().to_string(),
+    }
+}
+
+fn short_hash(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
 
 fn track_row(t: &FullTrack, selected: bool) -> String {
     let cursor = if selected { "▸" } else { " " };
@@ -1340,6 +1755,8 @@ fn main() {
                 println!("(see https://developer.spotify.com/dashboard), then opens");
                 println!("the browser for the one-time OAuth grant. Press ? inside");
                 println!("the TUI for the key reference.");
+                println!();
+                println!("Local music files (f) and internet radio (t) play through mpv.");
                 return;
             }
             _ => {}
@@ -1452,7 +1869,7 @@ fn main() {
     Crust::init();
     Crust::set_app_identity("Tune");
     Crust::clear_screen();
-    let mut app = App::new(spotify, cfg.poll_s, cfg.default_device);
+    let mut app = App::new(spotify, cfg.poll_s, cfg.default_device, cfg.device_name.clone(), &cfg.music_dir);
     app.poll_state();
     app.render_all();
 
@@ -1520,6 +1937,7 @@ impl App {
         // changes etc.
         self.cover_w = cover_cell_width_for_height(NOW_H);
         self.cover_track_id = None;
+        self.cover_checked.clear();
         self.footer.wrap = false; self.footer.scroll = false;
         Crust::clear_screen();
         true

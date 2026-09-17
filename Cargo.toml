@@ -1,9 +1,9 @@
 [package]
 name = "tune"
-version = "0.2.11"
+version = "0.3.0"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
-description = "Spotify Connect controller TUI. Part of the Fe2O3 Rust terminal suite."
+description = "Spotify, local music files and internet radio in the terminal. Part of the Fe2O3 Rust terminal suite."
 license = "Unlicense"
 repository = "https://github.com/isene/tune"
 

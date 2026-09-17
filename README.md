@@ -2,11 +2,13 @@
 
 <img src="img/tune.svg" align="right" width="150">
 
-**Spotify Connect controller. Written in Rust.**
+**Spotify, your music files and internet radio. Written in Rust.**
 
 ![Rust](https://img.shields.io/badge/language-Rust-f74c00) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Terminal controller for Spotify, *and* a Spotify Connect device. Search, browse playlists and saved tracks, queue items, switch devices, drive playback (play / pause / next / prev / seek / volume / shuffle / repeat). tune registers itself as a Spotify Connect endpoint via [librespot](https://github.com/librespot-org/librespot) — so audio plays right out of the same binary on whichever machine you launched it on — but it can also drive any *other* Connect device on your account (phone, desktop client, web player, smart speaker). Built on [crust](https://github.com/isene/crust). Part of the [Fe₂O₃ Rust terminal suite](https://github.com/isene/fe2o3).
+
+tune also plays the music files on your computer, and internet radio from a directory of tens of thousands of stations. Both go through [mpv](https://mpv.io).
 
 **Requires a Spotify Premium account.** librespot's audio stream requests are gated behind Premium; controller-only mode (search, browse, transport on *other* devices) still works for free accounts.
 
@@ -47,6 +49,8 @@ ln -s "$(pwd)/target/release/tune" ~/bin/tune
 | `L` | Liked / saved tracks |
 | `Q` | Up-next queue |
 | `d` | Spotify Connect devices |
+| `f` | Files: folders and music files on this computer |
+| `t` | Radio: your stations (`t` again leaves search results) |
 | `?` | Help |
 | **Playback** | |
 | `SPACE` | Play / pause |
@@ -55,13 +59,16 @@ ln -s "$(pwd)/target/release/tune" ~/bin/tune
 | `]` / `[` | Seek +5s / −5s |
 | `s` | Toggle shuffle |
 | `r` | Cycle repeat (off / context / track) |
+| `x` | Stop local files or radio |
 | **Lists** | |
 | `j` / `k` | Down / up |
 | `g` / `G` | Top / bottom |
 | `PgDn`/`PgUp` | Page down / up |
 | `ENTER` | Play this item / open playlist / switch to device |
-| `a` | Add this track to the queue |
-| `h` | Back to playlist list (from PlaylistTracks) |
+| `a` | Add this track to the queue; in Files, add a file to what plays; in Radio, keep a station |
+| `h` | Back to playlist list (from PlaylistTracks); in Files, up a folder |
+| `/` | In Radio: find stations by name or tag |
+| `D` | In Radio: remove one of your stations |
 | **Misc** | |
 | `R` | Refresh now-playing |
 | `q` | Quit |
@@ -73,6 +80,9 @@ ln -s "$(pwd)/target/release/tune" ~/bin/tune
 - **Switch device** (`d`) — pick any Spotify Connect device (your phone, desktop client, a speaker) and ENTER transfers playback there.
 - **Liked songs** (`L`) — your saved tracks, scroll and ENTER to play.
 - **Up next** (`Q`) — shows what Spotify will play after the current track. Context-driven autoplay also shows here once `current_user_queue` resolves it.
+- **Local files** (`f`): browse folders, starting in `music_dir`. ENTER on a file plays it and the rest of its folder after it; `a` adds a file to what plays. A `cover.jpg`, `folder.jpg` or `front.jpg` beside the files shows as the cover.
+- **Radio** (`t`): `/` searches [radio-browser.info](https://www.radio-browser.info) by name, or by a tag like jazz or news. ENTER plays; `a` keeps a station in `~/.tune/radio.yml` and `D` removes it. The now-playing strip shows the song the station sends, and its logo.
+- **Switching**: local files and radio pause Spotify when it plays on tune's own device. Playing anything from Spotify stops mpv, and so does `x`. The playback keys below work on all three.
 - **Transport** — SPACE pause/resume, n/b skip, +/− volume, [/] seek, s shuffle, r repeat. Status reflects current playback state on a 2s poll.
 
 ## What you can't do
@@ -90,7 +100,10 @@ poll_s: 2                 # now-playing refresh cadence, seconds
 default_device: ""        # preferred device id; empty = last-used
 local_player: true        # register tune itself as a Spotify Connect device
 device_name: "tune"       # name shown in Spotify Connect picker
+music_dir: ""             # where `f` starts; empty = ~/Music, or your home folder
 ```
+
+Your radio stations: `~/.tune/radio.yml`.
 
 Token cache: `~/.tune/token.json` (refresh token + access token; auto-refreshed when stale). Delete the file to force re-authorization (e.g. after adding a new scope).
 
@@ -101,6 +114,7 @@ tune is built to be quiet on a laptop:
 - **Idle (nothing playing):** librespot keeps a long-lived TCP keep-alive to Spotify's access-point server (one packet every ~30 s), the now-playing pane polls the Web API every `poll_s` seconds (default 2 s, one tiny request). Audio backend's sink suspends. CPU near zero, no audio device wakeups.
 - **Playing:** ogg/vorbis decode + pulseaudio write. Single-digit CPU% on any modern laptop.
 - **Paused:** same as idle.
+- **Local files and radio:** mpv decodes and plays. tune asks mpv where it is once a second over a local socket while it plays, and not at all while it is paused. The Spotify poll stops meanwhile.
 
 mDNS-based discovery (which would broadcast periodically) is **off by default** — tune authenticates via OAuth, so it doesn't need to advertise itself on the LAN. The librespot `with-libmdns` / `with-avahi` features are disabled.
 
@@ -112,7 +126,7 @@ See the [Fe₂O₃ suite overview](https://github.com/isene/fe2o3) and the [land
 
 **Build**: Rust toolchain.
 
-**Runtime**: a working browser for the one-time OAuth flow (`xdg-open` / `open` / equivalent). Once authorized, tune runs offline-of-the-browser — only the Spotify Web API needs to be reachable.
+**Runtime**: [mpv](https://mpv.io) for local files and radio (Spotify does not need it). A working browser for the one-time OAuth flow (`xdg-open` / `open` / equivalent). Once authorized, tune runs offline-of-the-browser — only the Spotify Web API needs to be reachable.
 
 ## License
 
