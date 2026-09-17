@@ -14,15 +14,24 @@
 //!
 //! No zeroconf (`with-libmdns` / `with-avahi` disabled in Cargo.toml)
 //! — discovery happens via OAuth, not MDNS broadcasts.
+//!
+//! Signing in: since 2026-08-10 Spotify refuses playback for a session
+//! signed in through a third-party app ID (librespot issue 1737), so
+//! tune's own Web API token no longer works here. The player signs in
+//! once through Spotify's desktop app ID, the one librespot uses by
+//! default, and the session saves reusable credentials in
+//! `~/.tune/librespot/credentials.json` for every later launch.
 
 use librespot::core::{Session, SessionConfig};
 use librespot::core::authentication::Credentials;
+use librespot::core::cache::Cache;
 use librespot::playback::audio_backend;
 use librespot::playback::config::{AudioFormat, PlayerConfig};
 use librespot::playback::mixer::{Mixer, MixerConfig, NoOpVolume};
 use librespot::playback::mixer::softmixer::SoftMixer;
 use librespot::playback::player::Player;
 use librespot::connect::{ConnectConfig, Spirc};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::oneshot;
@@ -42,14 +51,14 @@ impl LocalPlayer {
     /// user's Spotify Connect list and the controller-only path
     /// keeps working.
     ///
-    /// `access_token` MUST carry the `streaming` scope. `device_name`
-    /// is what shows up in everyone's Spotify Connect picker, so make
-    /// it identifiable (default: "tune").
-    pub fn start(access_token: String, device_name: String) -> Self {
+    /// `credentials` come from [`saved_credentials`] or [`sign_in`].
+    /// `device_name` is what shows up in everyone's Spotify Connect
+    /// picker, so make it identifiable (default: "tune").
+    pub fn start(credentials: Credentials, device_name: String) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let join = thread::Builder::new()
             .name("tune-librespot".into())
-            .spawn(move || run(access_token, device_name, shutdown_rx))
+            .spawn(move || run(credentials, device_name, shutdown_rx))
             .expect("spawn librespot thread");
         Self { shutdown_tx: Some(shutdown_tx), join: Some(join) }
     }
@@ -68,23 +77,44 @@ impl Drop for LocalPlayer {
     fn drop(&mut self) { self.shutdown(); }
 }
 
-fn run(access_token: String, device_name: String, shutdown_rx: oneshot::Receiver<()>) {
+fn credentials_dir() -> PathBuf {
+    crate::config::tune_dir().join("librespot")
+}
+
+/// The credentials a signed-in player session saved, if any.
+pub fn saved_credentials() -> Option<Credentials> {
+    Cache::new(Some(credentials_dir()), None, None, None).ok()?.credentials()
+}
+
+/// Sign in for playback through Spotify's desktop app ID: opens the
+/// browser and waits for the answer on 127.0.0.1:8898, the address that
+/// app ID accepts. Blocks until the user approves.
+pub fn sign_in() -> Result<Credentials, String> {
+    let client_id = SessionConfig::default().client_id;
+    let token = librespot::oauth::OAuthClientBuilder::new(&client_id, "http://127.0.0.1:8898/login", vec!["streaming"])
+        .open_in_browser()
+        .build()
+        .map_err(|e| e.to_string())?
+        .get_access_token()
+        .map_err(|e| e.to_string())?;
+    Ok(Credentials::with_access_token(token.access_token))
+}
+
+fn run(credentials: Credentials, device_name: String, shutdown_rx: oneshot::Receiver<()>) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build();
     let Ok(rt) = rt else { return; };
     rt.block_on(async move {
-        // Session: talks to the Spotify AP servers. Auth uses our
-        // existing OAuth access token — librespot only needs it for
-        // the initial handshake; the AP connection has its own
-        // long-lived auth ticket after that, so OAuth expiry doesn't
-        // kill the device mid-session.
+        // Session: talks to the Spotify AP servers. With the cache, the
+        // first connect saves reusable credentials, so the browser
+        // sign-in happens once.
         let session_config = SessionConfig {
             device_id: device_id_for_name(&device_name),
             ..SessionConfig::default()
         };
-        let session = Session::new(session_config, None);
-        let credentials = Credentials::with_access_token(access_token);
+        let cache = Cache::new(Some(credentials_dir()), None, None, None).ok();
+        let session = Session::new(session_config, cache);
         // Do NOT call `session.connect()` here — Spirc::new does its
         // own connect-with-credentials internally. Calling both
         // leaves Spirc unable to reach the AP connection's send_packet
@@ -148,7 +178,15 @@ fn run(access_token: String, device_name: String, shutdown_rx: oneshot::Receiver
         ).await;
         let (spirc, spirc_task) = match spirc_result {
             Ok(p) => p,
-            Err(e) => { eprintln!("librespot: spirc start failed: {}", e); return; }
+            Err(e) => {
+                eprintln!("librespot: spirc start failed: {}", e);
+                // Refused credentials: forget them, so the next launch signs in again.
+                if e.to_string().contains("CREDENTIALS") {
+                    let _ = std::fs::remove_file(credentials_dir().join("credentials.json"));
+                    eprintln!("librespot: removed the saved credentials; tune signs in again next launch.");
+                }
+                return;
+            }
         };
 
         tokio::select! {

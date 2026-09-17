@@ -1858,22 +1858,17 @@ fn main() {
     // lifetime of main(); dropping it on quit tears down Spirc and
     // de-registers the device from Spotify Connect.
     //
-    // librespot wants a fresh access token: Spotify's AP server can
-    // reject one that is 5+ minutes old. The refresh or sign-in just
-    // above made it seconds ago. (A second refresh here used to cost
-    // the refresh token whenever Spotify's answer left it out.)
+    // The player signs in on its own (see player.rs): saved credentials,
+    // or a one-time browser sign-in through Spotify's desktop app ID.
     let _local_player = if cfg.local_player {
-        let access_token = spotify.get_token()
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|t| t.access_token.clone()))
-            .unwrap_or_default();
-        if access_token.is_empty() {
-            eprintln!("tune: no access token available, skipping local player.");
-            None
-        } else {
-            Some(player::LocalPlayer::start(access_token, cfg.device_name.clone()))
-        }
+        let credentials = player::saved_credentials().or_else(|| {
+            eprintln!("tune: to play Spotify on this computer, sign in once more in the browser.");
+            eprintln!("      (Spotify only allows playback through its own desktop app ID.)");
+            player::sign_in()
+                .map_err(|e| eprintln!("tune: playback sign-in failed ({}); tune still controls your other devices.", e))
+                .ok()
+        });
+        credentials.map(|c| player::LocalPlayer::start(c, cfg.device_name.clone()))
     } else {
         None
     };

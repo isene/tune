@@ -22,6 +22,8 @@ tune talks to the Spotify Web API on your behalf, so it needs its own developer-
 4. Tick **Web API**, save.
 5. In the new app's **Settings**, copy the **Client ID**.
 
+Playing Spotify on the computer tune runs on needs one more sign-in, also in the browser, the first time. Since August 2026 Spotify allows that playback only through its own desktop app ID. tune keeps that sign-in in `~/.tune/librespot/`. Delete that folder to sign in again.
+
 Run `tune` for the first time — it prints these same instructions and prompts for the client ID. Once pasted, tune writes `~/.tune/config.yml`, opens your browser for the authorization grant, captures the redirect, and caches the token at `~/.tune/token.json`. Subsequent launches skip straight to the TUI.
 
 ## Install
