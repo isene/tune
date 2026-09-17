@@ -22,7 +22,7 @@ tune talks to the Spotify Web API on your behalf, so it needs its own developer-
 4. Tick **Web API**, save.
 5. In the new app's **Settings**, copy the **Client ID**.
 
-Playing Spotify on the computer tune runs on needs one more sign-in, also in the browser, the first time. Since August 2026 Spotify allows that playback only through its own desktop app ID. tune keeps that sign-in in `~/.tune/librespot/`. Delete that folder to sign in again.
+Playing Spotify on this computer needs one more browser sign-in, the first time. Since August 2026 Spotify allows that playback only through its own desktop app ID. tune keeps the sign-in in `~/.tune/librespot/`. Delete that folder to sign in again.
 
 Run `tune` for the first time — it prints these same instructions and prompts for the client ID. Once pasted, tune writes `~/.tune/config.yml`, opens your browser for the authorization grant, captures the redirect, and caches the token at `~/.tune/token.json`. Subsequent launches skip straight to the TUI.
 
@@ -117,7 +117,7 @@ tune is built to be quiet on a laptop:
 - **Idle (nothing playing):** librespot keeps a long-lived TCP keep-alive to Spotify's access-point server (one packet every ~30 s), the now-playing pane polls the Web API every `poll_s` seconds (default 2 s, one tiny request). Audio backend's sink suspends. CPU near zero, no audio device wakeups.
 - **Playing:** ogg/vorbis decode + pulseaudio write. Single-digit CPU% on any modern laptop.
 - **Paused:** same as idle.
-- **Local files and radio:** mpv decodes and plays. tune asks mpv where it is once a second over a local socket while it plays, and not at all while it is paused. The Spotify poll stops meanwhile.
+- **Local files and radio:** mpv decodes and plays. While it plays, tune asks mpv where it is once a second, over a local socket. While it is paused, tune asks nothing, and the Spotify poll stops too.
 
 mDNS-based discovery (which would broadcast periodically) is **off by default** — tune authenticates via OAuth, so it doesn't need to advertise itself on the LAN. The librespot `with-libmdns` / `with-avahi` features are disabled.
 
@@ -129,7 +129,7 @@ See the [Fe₂O₃ suite overview](https://github.com/isene/fe2o3) and the [land
 
 **Build**: Rust toolchain.
 
-**Runtime**: [mpv](https://mpv.io) for local files and radio (Spotify does not need it). A working browser for the one-time OAuth flow (`xdg-open` / `open` / equivalent). Once authorized, tune runs offline-of-the-browser — only the Spotify Web API needs to be reachable.
+**Runtime**: [mpv](https://mpv.io) for local files and radio (Spotify does not need it). A working browser for the one-time sign-ins (`xdg-open` / `open` / equivalent). Once authorized, tune runs offline-of-the-browser — only the Spotify Web API needs to be reachable.
 
 ## License
 
