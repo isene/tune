@@ -41,21 +41,40 @@ fn agent() -> String {
 }
 
 /// Stations whose name matches `query`, most played first. When no name
-/// matches, stations tagged with it (jazz, news, classical).
+/// matches, stations tagged with it (jazz, news, classical). A trailing
+/// `@NO` or `@Norway` keeps the search to one country.
 pub fn search(query: &str) -> Result<Vec<Station>, String> {
-    let by_name = fetch(&[("name", query)], 100)?;
+    let (query, country) = split_country(query);
+    let (field, value) = country_filter(country);
+    let by_name = fetch(&[("name", query), (field, &value)], 100)?;
     if !by_name.is_empty() { return Ok(by_name); }
-    fetch(&[("tag", query)], 100)
+    fetch(&[("tag", query), (field, &value)], 100)
 }
 
 /// A country's stations, most played first: by two-letter code (NO) or
 /// by the start of its English name (Norway).
 pub fn in_country(country: &str) -> Result<Vec<Station>, String> {
+    let (field, value) = country_filter(country);
+    fetch(&[(field, &value)], 500)
+}
+
+/// "jazz @NO" becomes ("jazz", "NO"); no `@` leaves the country empty.
+pub fn split_country(query: &str) -> (&str, &str) {
+    match query.rsplit_once('@') {
+        Some((q, c)) => (q.trim(), c.trim()),
+        None => (query.trim(), ""),
+    }
+}
+
+/// The directory's query field for a country given as a code or a name.
+/// An empty country matches every station.
+fn country_filter(country: &str) -> (&'static str, String) {
     let c = country.trim();
     if c.len() == 2 && c.chars().all(|ch| ch.is_ascii_alphabetic()) {
-        return fetch(&[("countrycode", &c.to_ascii_uppercase())], 500);
+        ("countrycode", c.to_ascii_uppercase())
+    } else {
+        ("country", country_name(c))
     }
-    fetch(&[("country", &country_name(c))], 500)
 }
 
 /// The directory matches country names letter case and all: "Norway",
@@ -71,7 +90,9 @@ fn fetch(filter: &[(&str, &str)], limit: usize) -> Result<Vec<Station>, String> 
     let mut last = String::new();
     for server in SERVERS {
         let mut req = ureq::get(&format!("{}/json/stations/search", server)).set("User-Agent", &agent());
-        for (field, value) in filter { req = req.query(field, value); }
+        for (field, value) in filter {
+            if !value.is_empty() { req = req.query(field, value); }
+        }
         let resp = req
             .query("limit", &limit.to_string())
             .query("hidebroken", "true")
@@ -157,6 +178,16 @@ mod tests {
         assert!(same_station(&kept, &kept.clone()));
         assert!(!same_station(&kept, &other));
         assert!(same_station(&kept, &no_id), "an entry without an id falls back to its URL");
+    }
+
+    #[test]
+    fn a_search_can_end_in_a_country() {
+        assert_eq!(split_country("jazz @NO"), ("jazz", "NO"));
+        assert_eq!(split_country("news@ Norway "), ("news", "Norway"));
+        assert_eq!(split_country("jazz"), ("jazz", ""));
+        assert_eq!(country_filter("no"), ("countrycode", "NO".to_string()));
+        assert_eq!(country_filter("united kingdom"), ("country", "United Kingdom".to_string()));
+        assert_eq!(country_filter(""), ("country", String::new()));
     }
 
     #[test]

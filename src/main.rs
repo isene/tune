@@ -1317,7 +1317,7 @@ impl App {
 
     fn radio_search_prompt(&mut self) {
         Cursor::show();
-        let q = self.footer.ask(" station or tag: ", &self.radio_query);
+        let q = self.footer.ask(" station or tag (add @NO or @Norway for one country): ", &self.radio_query);
         Cursor::hide();
         let q = q.trim().to_string();
         if q.is_empty() { return; }

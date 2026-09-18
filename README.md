@@ -69,7 +69,7 @@ ln -s "$(pwd)/target/release/tune" ~/bin/tune
 | `ENTER` | Play this item / open playlist / switch to device |
 | `a` | Add this track to the queue; in Files, add a file to what plays; in Radio, keep a station |
 | `h` | Back to playlist list (from PlaylistTracks); in Files, up a folder |
-| `/` | In Radio: find stations by name or tag |
+| `/` | In Radio: find stations by name or tag; `jazz @NO` keeps it to one country |
 | `c` | In Radio: a country's stations, by code (`NO`) or name (`Norway`) |
 | `D` | In Radio: remove one of your stations |
 | **Misc** | |
@@ -84,7 +84,7 @@ ln -s "$(pwd)/target/release/tune" ~/bin/tune
 - **Liked songs** (`L`) — your saved tracks, scroll and ENTER to play.
 - **Up next** (`Q`) — shows what Spotify will play after the current track. Context-driven autoplay also shows here once `current_user_queue` resolves it.
 - **Local files** (`f`): browse folders, starting in `music_dir`. ENTER on a file plays it and the rest of its folder after it; `a` adds a file to what plays. A `cover.jpg`, `folder.jpg` or `front.jpg` beside the files shows as the cover.
-- **Radio** (`t`): `/` searches [radio-browser.info](https://www.radio-browser.info) by name, or by a tag like jazz or news, and `c` lists a country's stations, most played first. ENTER plays; `a` keeps a station in `~/.tune/radio.yml` and `D` removes it. The now-playing strip shows the song the station sends, and its logo.
+- **Radio** (`t`): `/` searches [radio-browser.info](https://www.radio-browser.info) by name, or by a tag like jazz or news; `jazz @NO` or `news @Norway` keeps the search to one country. `c` lists a country's stations, most played first. ENTER plays; `a` keeps a station in `~/.tune/radio.yml` and `D` removes it. The now-playing strip shows the song the station sends, and its logo.
 - **Switching**: local files and radio pause Spotify when it plays on tune's own device. Playing anything from Spotify stops mpv, and so does `x`. The playback keys below work on all three.
 - **Transport** — SPACE pause/resume, n/b skip, +/− volume, [/] seek, s shuffle, r repeat. Status reflects current playback state on a 2s poll.
 
