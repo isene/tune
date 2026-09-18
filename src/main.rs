@@ -1355,7 +1355,7 @@ impl App {
 
     fn keep_station(&mut self) {
         let Some(st) = self.radio_list().get(self.radio_idx).cloned() else { return };
-        if self.stations.iter().any(|s| s.url == st.url) {
+        if self.stations.iter().any(|s| radio::same_station(s, &st)) {
             self.set_status("Already in your stations", t::FG_MUTED);
             return;
         }
@@ -1515,14 +1515,14 @@ impl App {
             return;
         }
         let playing = self.local.as_ref().and_then(|m| match &m.source {
-            local::Source::Radio(st) => Some(st.url.as_str()),
+            local::Source::Radio(st) => Some(st),
             local::Source::Files => None,
         });
         for (i, st) in list.iter().enumerate() {
             let selected = i == self.radio_idx;
             let cursor = if selected { "▸" } else { " " };
-            let mark = if playing == Some(st.url.as_str()) { "♪" }
-                else if self.stations.iter().any(|s| s.url == st.url) { "★" } else { " " };
+            let mark = if playing.is_some_and(|p| radio::same_station(p, st)) { "♪" }
+                else if self.stations.iter().any(|s| radio::same_station(s, st)) { "★" } else { " " };
             let quality = if st.bitrate > 0 { format!("{} {}k", st.codec, st.bitrate) } else { st.codec.clone() };
             let line = format!("  {} {} {:<40}  {:<3} {:<11}",
                 cursor, mark, truncate(&st.name, 40), st.country, truncate(&quality, 11));

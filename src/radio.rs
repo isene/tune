@@ -24,6 +24,14 @@ pub struct Station {
     pub uuid: String,
 }
 
+/// Whether two entries are the same station. The directory gives every
+/// station its own id; several CNN entries share one stream URL, so a
+/// URL match would star all of them when one is kept.
+pub fn same_station(a: &Station, b: &Station) -> bool {
+    if !a.uuid.is_empty() && !b.uuid.is_empty() { return a.uuid == b.uuid; }
+    a.url == b.url
+}
+
 /// The directory's own servers; the first answers fastest from Europe,
 /// the second picks any server that is up.
 const SERVERS: [&str; 2] = ["https://de1.api.radio-browser.info", "https://all.api.radio-browser.info"];
@@ -139,6 +147,16 @@ mod tests {
         let no_resolved = serde_json::json!({"name": "X", "url": "http://a/x"});
         assert_eq!(station(&no_resolved).unwrap().url, "http://a/x");
         assert!(station(&serde_json::json!({"name": "Y"})).is_none());
+    }
+
+    #[test]
+    fn stations_sharing_a_stream_are_still_different_stations() {
+        let kept = Station { name: "CNN INTERNATIONAL".into(), url: "http://s/2868".into(), uuid: "u1".into(), ..Default::default() };
+        let other = Station { name: "CNN".into(), url: "http://s/2868".into(), uuid: "u2".into(), ..Default::default() };
+        let no_id = Station { name: "CNN".into(), url: "http://s/2868".into(), ..Default::default() };
+        assert!(same_station(&kept, &kept.clone()));
+        assert!(!same_station(&kept, &other));
+        assert!(same_station(&kept, &no_id), "an entry without an id falls back to its URL");
     }
 
     #[test]
