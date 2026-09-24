@@ -1,6 +1,6 @@
 [package]
 name = "tune"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Spotify, local music files and internet radio in the terminal. Part of the Fe2O3 Rust terminal suite."

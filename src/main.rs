@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 use rspotify::{AuthCodePkceSpotify};
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::model::{
-    AdditionalType, Country, CurrentPlaybackContext, Device, FullArtist, FullTrack,
+    AdditionalType, AlbumType, Country, CurrentPlaybackContext, Device, FullArtist, FullTrack,
     Market, PlayableItem, PlayContextId, RepeatState, SearchResult, SearchType,
-    SimplifiedPlaylist,
+    SimplifiedAlbum, SimplifiedPlaylist,
 };
 
 /// One row in the Search results list. Artists and tracks both show
@@ -68,6 +68,8 @@ struct App {
     // UI
     header: Pane,
     main_p: Pane,
+    /// The right half of Search while an artist's releases are open.
+    rel_p:  Pane,
     now_p:  Pane,   // 4-row now-playing strip
     footer: Pane,
     cols:   u16,
@@ -79,6 +81,14 @@ struct App {
     search_query:     String,
     search_results:   Vec<SearchRow>,
     search_idx:       usize,
+    /// The artist whose releases fill the right pane, and those
+    /// releases, newest first. Row 0 of the pane plays the artist's
+    /// radio; row 1 on is `releases[row - 1]`.
+    releases_for:     Option<FullArtist>,
+    releases:         Vec<SimplifiedAlbum>,
+    rel_idx:          usize,
+    /// The cursor is in the releases pane, not the search results.
+    rel_focus:        bool,
     playlists:        Vec<SimplifiedPlaylist>,
     playlists_idx:    usize,
     playlist_tracks:  Vec<FullTrack>,
@@ -201,11 +211,13 @@ impl App {
             poll_interval: std::time::Duration::from_secs(poll_s.max(1)),
             last_progress_tick: std::time::Instant::now(),
             header, main_p, now_p, footer,
+            rel_p: Pane::new(1, 2, 1, 1, t::FG as u16, 0),
             cols, rows,
             view: View::Search,
             status: None,
             search_query: String::new(),
             search_results: Vec::new(), search_idx: 0,
+            releases_for: None, releases: Vec::new(), rel_idx: 0, rel_focus: false,
             playlists: Vec::new(),      playlists_idx: 0,
             playlist_tracks: Vec::new(), playlist_tracks_idx: 0,
             open_playlist: None,
@@ -324,6 +336,12 @@ impl App {
         // every keystroke on long lists.
         self.adjust_main_scroll();
         self.main_p.refresh();
+        if self.view == View::Search && self.releases_for.is_some() {
+            let lines = self.lines_releases();
+            self.rel_p.set_text(&lines.join("\n"));
+            keep_in_view(&mut self.rel_p, 3 + self.rel_idx);
+            self.rel_p.refresh();
+        }
     }
 
     /// Keep the selected list row within `SCROLLOFF` rows of the
@@ -336,6 +354,8 @@ impl App {
         const HEADER_OFFSET: usize = 3;
         let h = self.main_p.h as usize;
         if h == 0 { return; }
+        // The releases pane scrolls itself; the results stay put.
+        if self.view == View::Search && self.rel_focus { return; }
         let (idx, len) = self.current_list_indices();
         if len.is_none() { return; } // help view — no list
         let target = HEADER_OFFSET + idx;
@@ -820,7 +840,8 @@ impl App {
         for (key, desc) in [
             ("j / k",  "Down / up"),
             ("g / G",  "Top / bottom"),
-            ("ENTER",  "Play this item / open playlist"),
+            ("ENTER",  "Play this item / open playlist / an artist's releases"),
+            ("l / h",  "Into / out of an artist's releases (Search)"),
             ("a",      "Add this track to the queue"),
             ("h",      "Back to playlist list, or up a folder"),
         ] {
@@ -876,6 +897,8 @@ impl App {
             }
             "t"  => { self.view = View::Radio;      self.main_p.ix = 0;
                       self.stations = radio::saved(); }
+            "h" | "LEFT" if self.view == View::Search && self.rel_focus => self.rel_focus = false,
+            "l" | "RIGHT" if self.view == View::Search && self.releases_for.is_some() => self.rel_focus = true,
             "h" if self.view == View::PlaylistTracks => {
                 self.view = View::Playlists;        self.main_p.ix = 0;
             }
@@ -913,10 +936,113 @@ impl App {
             _ => {}
         }
         if self.view != was {
+            self.layout_main();
             self.render_header();
         }
         self.render_main();
         false
+    }
+
+    /// Search splits in two while an artist's releases are open: the
+    /// results on the left, the releases on the right. Every other
+    /// view has the whole width.
+    fn layout_main(&mut self) {
+        let h = self.rows.saturating_sub(2 + NOW_H + 1);
+        let ix = self.main_p.ix;
+        if self.view == View::Search && self.releases_for.is_some() {
+            let lw = self.cols / 2;
+            self.main_p = Pane::new(1, 2, lw, h, t::FG as u16, 0);
+            self.main_p.wrap = false;
+            self.rel_p = Pane::new(lw + 1, 2, self.cols - lw, h, t::FG as u16, 0);
+            self.rel_p.wrap = false;
+        } else {
+            self.main_p = Pane::new(1, 2, self.cols, h, t::FG as u16, 0);
+        }
+        self.main_p.ix = ix;
+    }
+
+    /// Enter on an artist: their albums and singles, newest first, in
+    /// the right pane, with the cursor moved there.
+    fn open_releases(&mut self, a: FullArtist) {
+        self.set_status(&format!("Loading releases by {}…", a.name), t::FG_MUTED);
+        self.render_footer();
+        let market = Some(Market::Country(Country::Norway));
+        let mut out: Vec<SimplifiedAlbum> = Vec::new();
+        let groups = [AlbumType::Album, AlbumType::Single];
+        let mut failed = None;
+        // Spotify answers 400 to pages over 10 items (since Feb 2026),
+        // so page by hand, 10 at a time, up to 100 releases.
+        let mut offset = 0u32;
+        loop {
+            match self.spotify.artist_albums_manual(a.id.clone_static(), groups, market.clone(), Some(10), Some(offset)) {
+                Ok(page) => {
+                    let more = page.next.is_some();
+                    out.extend(page.items);
+                    offset += 10;
+                    if !more || out.len() >= 100 { break; }
+                }
+                Err(e) => {
+                    failed = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        // Newest first; "2019" and "2019-05-03" sort together by text.
+        out.sort_by(|x, y| y.release_date.cmp(&x.release_date));
+        match failed {
+            Some(e) => self.set_status(&format!("Releases failed: {}", e), t::ERR),
+            None => self.set_status(&format!("{} releases by {}", out.len(), a.name), t::OK),
+        }
+        self.releases = out;
+        self.releases_for = Some(a);
+        self.rel_idx = 0;
+        self.rel_focus = true;
+        self.layout_main();
+    }
+
+    /// Enter in the releases pane: row 0 plays the artist's radio, any
+    /// other row plays that release from its first track.
+    fn play_release(&mut self) {
+        let Some(device_id) = self.resolve_device_id() else {
+            self.set_status(
+                "No Spotify Connect devices online — open Spotify on a phone or desktop first.",
+                t::AMBER);
+            return;
+        };
+        let (ctx, what) = if self.rel_idx == 0 {
+            let Some(a) = &self.releases_for else { return };
+            (PlayContextId::Artist(a.id.clone_static()), a.name.clone())
+        } else {
+            let Some(al) = self.releases.get(self.rel_idx - 1) else { return };
+            let Some(id) = &al.id else { return };
+            (PlayContextId::Album(id.clone_static()), al.name.clone())
+        };
+        match self.spotify.start_context_playback(ctx, Some(&device_id), None, None) {
+            Ok(_)  => self.set_status(&format!("Playing {}", what), t::OK),
+            Err(e) => self.set_status(&format!("Play failed: {}", e), t::ERR),
+        }
+    }
+
+    fn lines_releases(&self) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let name = self.releases_for.as_ref().map(|a| a.name.as_str()).unwrap_or("");
+        out.push(format!("  {}", style::bold(&style::fg(&format!("Releases by {}", name), t::ACCENT))));
+        out.push(String::new());
+        let w = (self.rel_p.w as usize).saturating_sub(24).max(10);
+        let row = |i: usize, text: String, tag: &str| {
+            let sel = self.rel_focus && i == self.rel_idx;
+            let cursor = if sel { "▸" } else { " " };
+            let line = format!("  {}  {}  {}", cursor, text, style::fg(tag, t::FG_DIM));
+            if sel { style::bold(&style::fg(&line, t::FG_BRIGHT)).to_string() } else { line }
+        };
+        out.push(row(0, format!("{:<w$}", truncate(&format!("♪ {}'s radio", name), w), w = w), "top tracks and similar"));
+        for (i, al) in self.releases.iter().enumerate() {
+            let year = al.release_date.as_deref().and_then(|d| d.get(..4)).unwrap_or("    ");
+            let kind = al.album_type.as_deref().unwrap_or("");
+            let text = format!("{}  {:<w$}", year, truncate(&al.name, w.saturating_sub(6)), w = w.saturating_sub(6));
+            out.push(row(i + 1, text, kind));
+        }
+        out
     }
 
     fn search_prompt(&mut self) {
@@ -953,6 +1079,9 @@ impl App {
         }
         self.search_results = rows;
         self.search_idx = 0;
+        self.releases_for = None;
+        self.rel_focus = false;
+        self.layout_main();
         self.render_footer();
     }
 
@@ -972,6 +1101,7 @@ impl App {
     }
     fn current_list_indices(&self) -> (usize, Option<usize>) {
         match self.view {
+            View::Search if self.rel_focus => (self.rel_idx, Some(self.releases.len() + 1)),
             View::Search          => (self.search_idx,          Some(self.search_results.len())),
             View::Playlists       => (self.playlists_idx,       Some(self.playlists.len())),
             View::PlaylistTracks  => (self.playlist_tracks_idx, Some(self.playlist_tracks.len())),
@@ -985,6 +1115,7 @@ impl App {
     }
     fn set_list_idx(&mut self, i: usize) {
         match self.view {
+            View::Search if self.rel_focus => self.rel_idx = i,
             View::Search          => self.search_idx = i,
             View::Playlists       => self.playlists_idx = i,
             View::PlaylistTracks  => self.playlist_tracks_idx = i,
@@ -1073,6 +1204,10 @@ impl App {
                         t::AMBER);
                     return;
                 };
+                if self.rel_focus {
+                    self.play_release();
+                    return;
+                }
                 match self.search_results.get(self.search_idx).cloned() {
                     Some(SearchRow::Track(t)) => {
                         if let Some(id) = t.id.clone() {
@@ -1086,20 +1221,7 @@ impl App {
                             }
                         }
                     }
-                    Some(SearchRow::Artist(a)) => {
-                        // Play the artist's "essentials" radio (top
-                        // tracks + similar) — Spotify resolves this
-                        // from the artist context_uri.
-                        let ctx = PlayContextId::Artist(a.id.clone_static());
-                        match self.spotify.start_context_playback(
-                            ctx, Some(&device_id), None, None)
-                        {
-                            Ok(_)  => self.set_status(
-                                &format!("Playing {}", a.name), t::OK),
-                            Err(e) => self.set_status(
-                                &format!("Play failed: {}", e), t::ERR),
-                        }
-                    }
+                    Some(SearchRow::Artist(a)) => self.open_releases(a),
                     None => {}
                 }
             }
@@ -1572,6 +1694,21 @@ fn track_row(t: &FullTrack, selected: bool) -> String {
     } else { line }
 }
 
+/// Scroll a pane so row `target` sits at least three rows from its
+/// top and bottom edges.
+fn keep_in_view(p: &mut Pane, target: usize) {
+    const SCROLLOFF: usize = 3;
+    let h = p.h as usize;
+    if h == 0 { return; }
+    let top = p.ix;
+    let bot = top + h.saturating_sub(1);
+    if target < top + SCROLLOFF {
+        p.ix = target.saturating_sub(SCROLLOFF);
+    } else if target + SCROLLOFF > bot {
+        p.ix = (target + SCROLLOFF + 1).saturating_sub(h);
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if crust::display_width(s) <= max { return s.to_string(); }
     let mut out = String::new();
@@ -1945,8 +2082,7 @@ impl App {
         self.cols = cols; self.rows = rows;
         self.header = Pane::new(1, 1, cols, 1, t::FG_BRIGHT as u16, t::BG_BAR as u16);
         self.header.wrap = false; self.header.scroll = false;
-        self.main_p = Pane::new(1, 2, cols, rows.saturating_sub(2 + NOW_H + 1),
-                                t::FG as u16, 0);
+        self.layout_main();
         self.now_p  = Pane::new(1, rows - NOW_H, cols, NOW_H,
                                 t::FG_BRIGHT as u16, t::BG_NOW as u16);
         self.now_p.wrap = false; self.now_p.scroll = false;
