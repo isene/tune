@@ -20,7 +20,7 @@ use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::model::{
     AdditionalType, AlbumType, Country, CurrentPlaybackContext, Device, FullArtist, FullTrack,
     Market, PlayableItem, PlayContextId, RepeatState, SearchResult, SearchType,
-    SimplifiedAlbum, SimplifiedPlaylist,
+    SimplifiedAlbum, SimplifiedPlaylist, SimplifiedTrack,
 };
 
 /// One row in the Search results list. Artists and tracks both show
@@ -89,6 +89,11 @@ struct App {
     rel_idx:          usize,
     /// The cursor is in the releases pane, not the search results.
     rel_focus:        bool,
+    /// An album opened from the releases: its songs fill the right
+    /// pane. Row 0 plays the whole album; row 1 on is `album_tracks[row - 1]`.
+    album:            Option<SimplifiedAlbum>,
+    album_tracks:     Vec<SimplifiedTrack>,
+    track_idx:        usize,
     playlists:        Vec<SimplifiedPlaylist>,
     playlists_idx:    usize,
     playlist_tracks:  Vec<FullTrack>,
@@ -218,6 +223,7 @@ impl App {
             search_query: String::new(),
             search_results: Vec::new(), search_idx: 0,
             releases_for: None, releases: Vec::new(), rel_idx: 0, rel_focus: false,
+            album: None, album_tracks: Vec::new(), track_idx: 0,
             playlists: Vec::new(),      playlists_idx: 0,
             playlist_tracks: Vec::new(), playlist_tracks_idx: 0,
             open_playlist: None,
@@ -339,7 +345,8 @@ impl App {
         if self.view == View::Search && self.releases_for.is_some() {
             let lines = self.lines_releases();
             self.rel_p.set_text(&lines.join("\n"));
-            keep_in_view(&mut self.rel_p, 3 + self.rel_idx);
+            let at = if self.album.is_some() { self.track_idx } else { self.rel_idx };
+            keep_in_view(&mut self.rel_p, 3 + at);
             self.rel_p.refresh();
         }
     }
@@ -842,6 +849,7 @@ impl App {
             ("g / G",  "Top / bottom"),
             ("ENTER",  "Play this item / open playlist / an artist's releases"),
             ("l / h",  "Into / out of an artist's releases (Search)"),
+            ("ENTER",  "On a release: its songs; h goes back"),
             ("a",      "Add this track to the queue"),
             ("h",      "Back to playlist list, or up a folder"),
         ] {
@@ -897,6 +905,10 @@ impl App {
             }
             "t"  => { self.view = View::Radio;      self.main_p.ix = 0;
                       self.stations = radio::saved(); }
+            "h" | "LEFT" if self.view == View::Search && self.album.is_some() => {
+                self.album = None;
+                self.rel_p.ix = 0;
+            }
             "h" | "LEFT" if self.view == View::Search && self.rel_focus => self.rel_focus = false,
             "l" | "RIGHT" if self.view == View::Search && self.releases_for.is_some() => self.rel_focus = true,
             "h" if self.view == View::PlaylistTracks => {
@@ -995,13 +1007,45 @@ impl App {
         }
         self.releases = out;
         self.releases_for = Some(a);
+        self.album = None;
         self.rel_idx = 0;
         self.rel_focus = true;
         self.layout_main();
     }
 
+    /// An album's songs, 10 at a time (Spotify's cap), into the right pane.
+    fn open_album(&mut self, al: SimplifiedAlbum) {
+        let Some(id) = al.id.clone() else { return };
+        self.set_status(&format!("Loading {}…", al.name), t::FG_MUTED);
+        self.render_footer();
+        let market = Some(Market::Country(Country::Norway));
+        let mut out: Vec<SimplifiedTrack> = Vec::new();
+        let mut offset = 0u32;
+        let mut failed = None;
+        loop {
+            match self.spotify.album_track_manual(id.clone_static(), market.clone(), Some(10), Some(offset)) {
+                Ok(page) => {
+                    let more = page.next.is_some();
+                    out.extend(page.items);
+                    offset += 10;
+                    if !more || out.len() >= 200 { break; }
+                }
+                Err(e) => { failed = Some(e.to_string()); break; }
+            }
+        }
+        match failed {
+            Some(e) => self.set_status(&format!("Songs failed: {}", e), t::ERR),
+            None => self.set_status(&format!("{} songs on {}", out.len(), al.name), t::OK),
+        }
+        self.album_tracks = out;
+        self.album = Some(al);
+        self.track_idx = 0;
+        self.rel_p.ix = 0;
+    }
+
     /// Enter in the releases pane: row 0 plays the artist's radio, any
-    /// other row plays that release from its first track.
+    /// other row plays that release from its first track. Inside an
+    /// album, row 0 plays it all and a song plays the album from there.
     fn play_release(&mut self) {
         let Some(device_id) = self.resolve_device_id() else {
             self.set_status(
@@ -1009,6 +1053,19 @@ impl App {
                 t::AMBER);
             return;
         };
+        if let Some(al) = &self.album {
+            let Some(id) = &al.id else { return };
+            let ctx = PlayContextId::Album(id.clone_static());
+            let (offset, what) = match self.track_idx.checked_sub(1).and_then(|i| self.album_tracks.get(i)) {
+                Some(tr) => (tr.id.as_ref().map(|t| rspotify::model::Offset::Uri(t.uri())), tr.name.clone()),
+                None => (None, al.name.clone()),
+            };
+            match self.spotify.start_context_playback(ctx, Some(&device_id), offset, None) {
+                Ok(_)  => self.set_status(&format!("Playing {}", what), t::OK),
+                Err(e) => self.set_status(&format!("Play failed: {}", e), t::ERR),
+            }
+            return;
+        }
         let (ctx, what) = if self.rel_idx == 0 {
             let Some(a) = &self.releases_for else { return };
             (PlayContextId::Artist(a.id.clone_static()), a.name.clone())
@@ -1024,6 +1081,9 @@ impl App {
     }
 
     fn lines_releases(&self) -> Vec<String> {
+        if let Some(al) = &self.album {
+            return self.lines_album(al);
+        }
         let mut out = vec![String::new()];
         let name = self.releases_for.as_ref().map(|a| a.name.as_str()).unwrap_or("");
         out.push(format!("  {}", style::bold(&style::fg(&format!("Releases by {}", name), t::ACCENT))));
@@ -1041,6 +1101,29 @@ impl App {
             let kind = al.album_type.as_deref().unwrap_or("");
             let text = format!("{}  {:<w$}", year, truncate(&al.name, w.saturating_sub(6)), w = w.saturating_sub(6));
             out.push(row(i + 1, text, kind));
+        }
+        out
+    }
+
+    /// An album's songs: number, name, length. `h` goes back.
+    fn lines_album(&self, al: &SimplifiedAlbum) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let year = al.release_date.as_deref().and_then(|d| d.get(..4)).unwrap_or("");
+        out.push(format!("  {}  {}", style::bold(&style::fg(&al.name, t::ACCENT)), style::fg(year, t::FG_DIM)));
+        out.push(String::new());
+        let w = (self.rel_p.w as usize).saturating_sub(20).max(10);
+        let row = |i: usize, text: String, tag: String| {
+            let sel = self.rel_focus && i == self.track_idx;
+            let cursor = if sel { "▸" } else { " " };
+            let line = format!("  {}  {}  {}", cursor, text, style::fg(&tag, t::FG_DIM));
+            if sel { style::bold(&style::fg(&line, t::FG_BRIGHT)).to_string() } else { line }
+        };
+        out.push(row(0, format!("{:<w$}", truncate("♪ The whole album", w), w = w), String::new()));
+        let discs = self.album_tracks.iter().map(|t| t.disc_number).max().unwrap_or(1);
+        for (i, tr) in self.album_tracks.iter().enumerate() {
+            let n = if discs > 1 { format!("{}-{:02}", tr.disc_number, tr.track_number) } else { format!("{:>2}", tr.track_number) };
+            let text = format!("{}  {:<w$}", n, truncate(&tr.name, w.saturating_sub(n.len() + 2)), w = w.saturating_sub(n.len() + 2));
+            out.push(row(i + 1, text, fmt_ms(tr.duration.num_milliseconds().max(0) as u64)));
         }
         out
     }
@@ -1080,6 +1163,7 @@ impl App {
         self.search_results = rows;
         self.search_idx = 0;
         self.releases_for = None;
+        self.album = None;
         self.rel_focus = false;
         self.layout_main();
         self.render_footer();
@@ -1101,6 +1185,7 @@ impl App {
     }
     fn current_list_indices(&self) -> (usize, Option<usize>) {
         match self.view {
+            View::Search if self.album.is_some() => (self.track_idx, Some(self.album_tracks.len() + 1)),
             View::Search if self.rel_focus => (self.rel_idx, Some(self.releases.len() + 1)),
             View::Search          => (self.search_idx,          Some(self.search_results.len())),
             View::Playlists       => (self.playlists_idx,       Some(self.playlists.len())),
@@ -1115,6 +1200,7 @@ impl App {
     }
     fn set_list_idx(&mut self, i: usize) {
         match self.view {
+            View::Search if self.album.is_some() => self.track_idx = i,
             View::Search if self.rel_focus => self.rel_idx = i,
             View::Search          => self.search_idx = i,
             View::Playlists       => self.playlists_idx = i,
@@ -1143,6 +1229,13 @@ impl App {
     }
 
     fn list_activate(&mut self) {
+        // Enter on a release opens it; only a pick below plays.
+        if self.view == View::Search && self.rel_focus && self.album.is_none() && self.rel_idx > 0 {
+            if let Some(al) = self.releases.get(self.rel_idx - 1).cloned() {
+                self.open_album(al);
+            }
+            return;
+        }
         match self.view {
             View::Files => { self.activate_file(); return; }
             View::Radio => { self.play_station(); return; }

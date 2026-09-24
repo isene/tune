@@ -79,7 +79,7 @@ ln -s "$(pwd)/target/release/tune" ~/bin/tune
 ## What you can do
 
 - **Search** for tracks (`/` → type query). ENTER plays the cursor; `a` adds it to the queue.
-- **An artist's releases**: ENTER on an artist in the search results lists their albums and singles on the right, newest first. ENTER plays one; the top row plays the artist's radio. `h` and `l` move between the two lists.
+- **An artist's releases**: ENTER on an artist in the search results lists their albums and singles on the right, newest first. The top row plays the artist's radio. ENTER on a release opens its songs: the top row plays the whole album, and ENTER on a song plays the album from that song. `h` goes back a step; `l` moves into the right pane.
 - **Browse** your playlists (`P`), open one with ENTER, scroll, ENTER again to play from that track within the playlist context. `h` goes back to the playlist list.
 - **Switch device** (`d`) — pick any Spotify Connect device (your phone, desktop client, a speaker) and ENTER transfers playback there.
 - **Liked songs** (`L`) — your saved tracks, scroll and ENTER to play.
