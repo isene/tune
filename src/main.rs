@@ -312,10 +312,10 @@ impl App {
             View::Help            => "Help",
         };
         let left = format!(" tune  [{}]", style::bold(&style::fg(view_lbl, t::ACCENT)));
-        let right = format!("{}  {}  v{} ",
+        let right = format!("{}  {}  {}",
             style::fg(&self.user_display_name, t::FG_MUTED),
             style::fg(&format!("◆ {}", dev), t::CYAN),
-            VERSION);
+            crust::version_tag("tune", VERSION));
         let pad_w = (self.cols as usize)
             .saturating_sub(crust::display_width(&left) + crust::display_width(&right));
         self.header.set_text(&format!("{}{}{}", left, " ".repeat(pad_w), right));
