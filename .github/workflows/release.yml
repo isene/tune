@@ -16,7 +16,8 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            # 24.04, not latest: built on a newer Ubuntu, the binary needs a newer glibc than Debian 13 and Ubuntu 24.04 have.
+            os: ubuntu-24.04
             artifact: tune-linux-x86_64
           # aarch64-linux cross-compile dropped: alsa-sys + libpulse-sys
           # both need their dev headers in the cross sysroot, and the
